@@ -61,5 +61,8 @@ COPY --chown=root:root --chmod=755 docker-entrypoint.sh /usr/local/bin/
 
 VOLUME ["/app/config"]
 
+COPY --chown=root:solaredge2mqtt --chmod=755 main_healthcheck.py /app/main_healthcheck
+HEALTHCHECK --interval=45s --timeout=5s --start-period=20s --retries=5 CMD python3 main_healthcheck.py || exit 1
+
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["python3", "-m", "solaredge2mqtt"]
