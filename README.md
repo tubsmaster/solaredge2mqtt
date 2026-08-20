@@ -36,6 +36,7 @@ SolarEdge2MQTT provides a comprehensive feature set for power monitoring, home a
 - 💸 **Price-based savings calculation** for consumption and export
 - 🔌 **SolarEdge Wallbox monitoring** via REST API
 - 🌐 **Module-level monitoring** by retrieving data directly from the SolarEdge monitoring site (no API key needed)
+- 🚗 **EV charger monitoring and control** via SolarEdge monitoring account — status, session energy, and remote charge level control
 - 🐳 **Docker and Docker Compose support** for easy deployment
 - 🧪 **Console mode** for development and testing
 
@@ -165,6 +166,22 @@ location:
 # Set to true if you have additional producers
 powerflow:
   external_production: false
+
+# Optional status debounce per service (consecutive checks required before state switch)
+modbus:
+  debounce_cycles: 2
+
+# wallbox:
+#   debounce_cycles: 2
+
+# monitoring:
+#   debounce_cycles: 2
+
+# weather:
+#   debounce_cycles: 2
+
+# influxdb:
+#   debounce_cycles: 2
 ```
 
 ### Basic Modbus configuration
@@ -189,7 +206,13 @@ modbus:
   
   # Check grid status (requires extra hardware)
   check_grid_status: false
+
+  # Startup device detection retry (retries indefinitely, never gives up)
+  startup_retry_delay: 30       # Initial delay between retries in seconds (default: 30)
+  startup_retry_max_delay: 300  # Delay doubles after each retry, capped here (default: 300)
 ```
+
+If the inverter is unreachable during startup device detection (e.g. a brief Modbus outage), the service retries with exponential backoff instead of crashing — the delay starts at `startup_retry_delay` and doubles on each attempt up to `startup_retry_max_delay`.
 
 ### Leader/follower setup
 
@@ -198,13 +221,15 @@ SolarEdge inverters support a cascading setup, where one inverter acts as the le
 - For the leader inverter, use the basic Modbus settings described above.
 - For each follower inverter, add them to the configuration as shown below.
 
+#### Cascaded inverters (shared Modbus connection)
+
+When followers are wired in a RS485 cascade behind the leader, they share the leader's TCP connection. Only set `unit` (the Modbus device address on the bus) and optionally meter/battery flags:
+
 ```yaml
 modbus:
-  # Leader configuration
   host: 192.168.1.100
   port: 1502
   
-  # Follower inverters
   follower:
     - unit: 2
       meter: [false, false, false]
@@ -214,6 +239,38 @@ modbus:
       battery: [true, false]
 ```
 
+#### Physically separate inverters (individual TCP connections)
+
+When each inverter has its own network connection (e.g. each has its own IP address), specify `host` and optionally `port` per follower. Each follower with its own `host` opens a dedicated TCP connection; those without fall back to the leader's connection:
+
+```yaml
+modbus:
+  # Leader
+  host: 192.168.1.100
+  port: 1502
+
+  follower:
+    # Follower on the same host (cascaded, shares leader connection)
+    - unit: 2
+      meter: [false, false, false]
+      battery: [false, false]
+
+    # Follower with its own IP and default port (1502 inherited from leader)
+    - unit: 1
+      host: 192.168.1.101
+      meter: [true, false, false]
+      battery: [true, false]
+
+    # Follower with its own IP and a custom port
+    - unit: 1
+      host: 192.168.1.102
+      port: 502
+      meter: [false, false, false]
+      battery: [true, true]
+```
+
+When a follower omits `port`, the leader's port is used. When a follower omits `host`, the leader's host and connection are reused.
+
 You can configure up to 11 inverters in total: one leader and up to 10 followers. Each configured inverter will report:
 
 - individual power flow data
@@ -221,7 +278,7 @@ You can configure up to 11 inverters in total: one leader and up to 10 followers
 - cumulative energy and power flow data
 - cumulative production forecasts (if forecasting is enabled)
 
-This setup allows for comprehensive multi-inverter support in systems with cascaded SolarEdge installations.
+This setup allows for comprehensive multi-inverter support in systems with cascaded or physically separate SolarEdge installations.
 
 ### MQTT configuration
 
@@ -235,14 +292,32 @@ mqtt:
   topic_prefix: solaredge          # MQTT topic prefix
   use_tls: false                   # Enable TLS encryption (default: false)
   ca_certs: /path/to/ca.pem        # Path to CA certificate bundle
+  certfile: /path/to/client.pem    # Client certificate for mutual TLS
+  keyfile: /path/to/client.key     # Private key matching certfile
+  keyfile_password: !secret mqtt_keyfile_password  # Only if the private key is encrypted
   tls_verify: true                 # Verify TLS certificates (default: true)
 ```
+
+If your broker authenticates clients by certificate instead of (or in addition to) a
+password, set `certfile` and `keyfile` to the client keypair. They are only used when
+`use_tls` is enabled, and `keyfile_password` is needed only when the private key itself is
+encrypted. All three are unset by default.
 
 **Note**: Store your password securely in `secrets.yml`:
 ```yaml
 # secrets.yml
 mqtt_password: "your_actual_password"
+mqtt_keyfile_password: "your_actual_key_password"
 ```
+
+The service also publishes operational topics below the configured `topic_prefix`:
+
+- `status/<service>` for subservice connection states (`online`/`offline`) such as `modbus`, `wallbox`, `monitoring`, `influxdb`, and `weather_api`
+- `logging` for runtime log messages (MQTT warnings/errors are excluded from MQTT log forwarding)
+
+Use the `debounce_cycles` field within each service's configuration to reduce status flapping by requiring repeated
+online/offline observations before a state change is published.
+
 ### Retain Configuration
 
 By default, MQTT messages are not retained. You can configure the retain flag for each message type:
@@ -288,6 +363,49 @@ Remember to add the site_id and password to `secrets.yml`:
 monitoring_site_id: "12345678"
 monitoring_password: "your_monitoring_password"
 ```
+
+#### EV Charger monitoring and control
+
+If EV chargers are registered in your SolarEdge monitoring account, they are automatically discovered on startup — no additional configuration is needed beyond the standard monitoring credentials above.
+
+Status is polled on every base interval and published to MQTT under:
+
+```
+monitoring/evcharger/{reporter_id}
+```
+
+The payload includes:
+
+| Field | Description |
+|---|---|
+| `charge_level` | Current charge level (0–100 %) |
+| `charger_status` | Status string (e.g. `CHARGING`, `IDLE`) |
+| `connected` | Whether a vehicle is plugged in (`true`/`false`) |
+| `session_energy` | Energy delivered in the current session (Wh) |
+| `rated_power` | Rated charging power (W) |
+
+**Charge level control**
+
+To set the charge level remotely, publish to:
+
+```
+monitoring/evcharger/{reporter_id}/charge_level
+```
+
+with a JSON payload:
+
+```json
+{"level": 100}
+```
+
+`level` must be an integer 0 for off or 100 for on. Other values are not possible at the moment. The service translates this into a MANUAL mode command sent to the SolarEdge monitoring API.
+
+When Home Assistant auto discovery is enabled, the following entities are created automatically per charger:
+
+- A **number** entity for charge level control
+- A **sensor** for charger status
+- A **binary sensor** for vehicle connection (plug)
+- **Sensors** for session energy and rated power
 
 ### Wallbox
 
@@ -390,6 +508,17 @@ forecast:
 - Data recording must be consistent (gaps longer than an hour prevent training data collection)
 
 > **Note**: Forecast service is not available for `arm/v7` architectures due to dependency compatibility issues.
+
+**Tip**:
+
+Want to use SolarEdge2MQTT forecasts in the Home Assistant Energy Dashboard?
+
+Install the companion integration:
+
+SolarEdge2MQTT Forecast
+https://github.com/DerOetzi/solaredge2mqtt_forecast
+
+It consumes forecast data published by SolarEdge2MQTT via MQTT and makes it available as a solar forecast provider in Home Assistant.
 
 ## Running the service
 

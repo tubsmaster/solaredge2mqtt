@@ -14,20 +14,24 @@ class LoggerSpy:
     def __init__(self):
         self.infos = []
         self.traces = []
+        self.debugs = []
         self.warnings = []
         self.errors = []
 
-    def info(self, message, **kwargs):
-        self.infos.append((message, kwargs))
+    def info(self, __message, **kwargs):
+        self.infos.append((__message, kwargs))
 
-    def trace(self, message, **kwargs):
-        self.traces.append((message, kwargs))
+    def trace(self, __message, **kwargs):
+        self.traces.append((__message, kwargs))
 
-    def warning(self, message, **kwargs):
-        self.warnings.append((message, kwargs))
+    def debug(self, __message, **kwargs):
+        self.debugs.append((__message, kwargs))
 
-    def error(self, message, **kwargs):
-        self.errors.append((message, kwargs))
+    def warning(self, __message, **kwargs):
+        self.warnings.append((__message, kwargs))
+
+    def error(self, __message, **kwargs):
+        self.errors.append((__message, kwargs))
 
 
 class TestEvent(BaseEvent):
@@ -72,7 +76,7 @@ class TestEventBus:
             del event
 
         event_bus.subscribe(TestEvent, listener)
-        listeners = event_bus.subscribed_events
+        listeners = event_bus.subscribed_events()
         assert TestEvent in listeners
 
     def test_subscribe_multiple_events(self, event_bus):
@@ -86,7 +90,7 @@ class TestEventBus:
             """Another test event."""
 
         event_bus.subscribe([TestEvent, AnotherEvent], listener)
-        events = event_bus.subscribed_events
+        events = event_bus.subscribed_events()
         assert TestEvent in events
         assert AnotherEvent in events
 
@@ -99,7 +103,7 @@ class TestEventBus:
 
         event_bus.subscribe(TestEvent, listener)
 
-        events = event_bus.subscribed_events
+        events = event_bus.subscribed_events()
         assert TestEvent in events
 
     def test_unsubscribe(self, event_bus):
@@ -112,7 +116,7 @@ class TestEventBus:
         event_bus.subscribe(TestEvent, listener)
         event_bus.unsubscribe(TestEvent, listener)
 
-        events = event_bus.subscribed_events
+        events = event_bus.subscribed_events()
         assert TestEvent not in events
 
     @pytest.mark.asyncio
@@ -148,7 +152,7 @@ class TestEventBus:
         event_bus.unsubscribe(TestEvent, other_listener)
 
         # Original listener should still be subscribed
-        events = event_bus.subscribed_events
+        events = event_bus.subscribed_events()
         assert TestEvent in events
 
     def test_unsubscribe_with_no_registered_event(self, event_bus):
@@ -158,7 +162,7 @@ class TestEventBus:
             del event
 
         event_bus.unsubscribe(TestEvent, listener)
-        assert TestEvent not in event_bus.subscribed_events
+        assert TestEvent not in event_bus.subscribed_events()
 
     def test_unsubscribe_all(self, event_bus):
         """Test unsubscribing all listeners for an event."""
@@ -175,7 +179,7 @@ class TestEventBus:
         event_bus.subscribe(TestEvent, listener2)
         event_bus.unsubscribe_all(TestEvent)
 
-        events = event_bus.subscribed_events
+        events = event_bus.subscribed_events()
         assert TestEvent not in events
 
     @pytest.mark.asyncio
@@ -299,25 +303,95 @@ class TestEventBus:
         await event_bus.emit(event)  # Should not raise
 
     @pytest.mark.asyncio
+    async def test_repeated_invalid_data_exception_debounces_to_debug(
+        self, event_bus, monkeypatch
+    ):
+        """Repeated failures from the same listener are debounced to DEBUG."""
+        logger_spy = LoggerSpy()
+        monkeypatch.setattr("solaredge2mqtt.core.events.logger", logger_spy)
+
+        async def failing_listener(evt):
+            del evt
+            raise InvalidDataException("Test invalid data")
+
+        event_bus.subscribe(AwaitingTestEvent, failing_listener)
+        event = AwaitingTestEvent()
+
+        await event_bus.emit(event)
+        await event_bus.emit(event)
+        await event_bus.emit(event)
+
+        assert len(logger_spy.warnings) == 1
+        assert len(logger_spy.debugs) == 2
+
+    @pytest.mark.asyncio
+    async def test_invalid_data_exception_reescalates_after_repeat_threshold(
+        self, event_bus, monkeypatch
+    ):
+        """A sustained failure re-escalates to WARNING every repeat threshold."""
+        logger_spy = LoggerSpy()
+        monkeypatch.setattr("solaredge2mqtt.core.events.logger", logger_spy)
+
+        async def failing_listener(evt):
+            del evt
+            raise InvalidDataException("Test invalid data")
+
+        event_bus.subscribe(AwaitingTestEvent, failing_listener)
+        event_bus._listener_error_streaks[id(failing_listener)] = 59
+        event = AwaitingTestEvent()
+
+        await event_bus.emit(event)
+
+        assert event_bus._listener_error_streaks[id(failing_listener)] == 60
+        assert len(logger_spy.warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_invalid_data_exception_recovery_logs_once_and_resets_streak(
+        self, event_bus, monkeypatch
+    ):
+        """Recovery after failures clears the streak and logs a single INFO."""
+        logger_spy = LoggerSpy()
+        monkeypatch.setattr("solaredge2mqtt.core.events.logger", logger_spy)
+
+        calls = {"count": 0}
+
+        async def flaky_listener(evt):
+            del evt
+            calls["count"] += 1
+            if calls["count"] < 3:
+                raise InvalidDataException("Test invalid data")
+
+        event_bus.subscribe(AwaitingTestEvent, flaky_listener)
+        event = AwaitingTestEvent()
+
+        await event_bus.emit(event)
+        await event_bus.emit(event)
+        await event_bus.emit(event)
+
+        assert id(flaky_listener) not in event_bus._listener_error_streaks
+        recovered_logs = [call for call in logger_spy.infos if "recovered" in call[0]]
+        assert len(recovered_logs) == 1
+
+    @pytest.mark.asyncio
     async def test_emit_raises_stored_critical_error(self):
-        bus = EventBus()
+        EventBus._critical_error = None
 
         async def failing():
             raise MqttError("boom")
 
         task = asyncio.create_task(failing())
         await asyncio.gather(task, return_exceptions=True)
-        bus._tasks.add(task)
-        bus._handle_task_done(task)
+        EventBus._tasks.add(task)
+        EventBus._handle_task_done(task)
 
         with pytest.raises(MqttError):
-            await bus.emit(TestEvent())
+            await EventBus.emit(TestEvent())
 
-        assert bus._critical_error is None
+        assert EventBus._critical_error is None
 
     @pytest.mark.asyncio
     async def test_handle_task_done_logs_second_critical_error(self, monkeypatch):
-        bus = EventBus()
+        EventBus._critical_error = None
         logger_spy = LoggerSpy()
         monkeypatch.setattr("solaredge2mqtt.core.events.logger", logger_spy)
 
@@ -326,15 +400,15 @@ class TestEventBus:
 
         first = asyncio.create_task(failing(MqttError("first")))
         await asyncio.gather(first, return_exceptions=True)
-        bus._tasks.add(first)
-        bus._handle_task_done(first)
+        EventBus._tasks.add(first)
+        EventBus._handle_task_done(first)
 
         second = asyncio.create_task(failing(MqttError("second")))
         await asyncio.gather(second, return_exceptions=True)
-        bus._tasks.add(second)
-        bus._handle_task_done(second)
+        EventBus._tasks.add(second)
+        EventBus._handle_task_done(second)
 
-        assert bus._critical_error is not None
+        assert EventBus._critical_error is not None
         assert logger_spy.warnings
 
     @pytest.mark.asyncio
@@ -383,7 +457,7 @@ class TestEventBus:
     def test_unsubscribe_all_for_non_subscribed_event(self, event_bus):
         """Test unsubscribe_all is a no-op for unknown event."""
         event_bus.unsubscribe_all(TestEvent)
-        assert TestEvent not in event_bus.subscribed_events
+        assert TestEvent not in event_bus.subscribed_events()
 
     @pytest.mark.asyncio
     async def test_notify_listeners_raises_mqtt_error(self, event_bus):
@@ -453,12 +527,11 @@ class TestEventBus:
     @pytest.mark.asyncio
     async def test_cancel_tasks_clears_critical_error(self):
         """Test cancel_tasks resets stored critical error."""
-        bus = EventBus()
-        bus._critical_error = MqttError("old")
+        EventBus._critical_error = MqttError("old")
 
-        await bus.cancel_tasks()
+        await EventBus.cancel_tasks()
 
-        assert bus._critical_error is None
+        assert EventBus._critical_error is None
 
     @pytest.mark.asyncio
     async def test_cancel_tasks_cancels_pending_tasks(self):

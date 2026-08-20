@@ -7,6 +7,7 @@ from solaredge2mqtt.core.models import Solaredge2MQTTBaseModel
 class Component(Solaredge2MQTTBaseModel, ABC):
     COMPONENT: ClassVar[str] = "unknown"
     SOURCE: ClassVar[str | None] = None
+    AVAILABILITY_SERVICE: ClassVar[str | None] = None
 
     @property
     def influxdb_tags(self) -> dict[str, str]:
@@ -38,4 +39,6 @@ class Component(Solaredge2MQTTBaseModel, ABC):
 
 TComponent = TypeVar("TComponent", bound=Component)
 
-HTTPResponse: TypeAlias = dict | list | str | float | int | bool | None
+HTTPRequestPayload: TypeAlias = dict[str, str | int | float | bool | None]
+
+HTTPResponsePayload: TypeAlias = dict | list | str | float | int | bool | None

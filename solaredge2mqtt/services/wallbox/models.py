@@ -13,7 +13,7 @@ from solaredge2mqtt.services.homeassistant.models import (
 from solaredge2mqtt.services.homeassistant.models import (
     HomeAssistantSensorType as HASensor,
 )
-from solaredge2mqtt.services.models import Component, HTTPResponse
+from solaredge2mqtt.services.models import Component, HTTPResponsePayload
 
 
 class WallboxInfo(Solaredge2MQTTBaseModel):
@@ -49,6 +49,7 @@ class WallboxInfo(Solaredge2MQTTBaseModel):
 class WallboxAPI(Component):
     COMPONENT = "wallbox"
     SOURCE = "api"
+    AVAILABILITY_SERVICE = "wallbox"
 
     info: SkipJsonSchema[WallboxInfo]
 
@@ -58,7 +59,7 @@ class WallboxAPI(Component):
     max_current: float = Field(**HASensor.CURRENT_A.field("Max current"))
 
     @classmethod
-    def from_http_response(cls, response: HTTPResponse) -> WallboxAPI:
+    def from_http_response(cls, response: HTTPResponsePayload) -> WallboxAPI:
         if not isinstance(response, dict):
             raise InvalidDataException("Invalid Wallbox data")
 

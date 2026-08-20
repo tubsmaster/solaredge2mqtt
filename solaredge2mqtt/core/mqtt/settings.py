@@ -4,6 +4,8 @@ from typing import Any
 from aiomqtt import TLSParameters
 from pydantic import BaseModel, Field, SecretStr
 
+from solaredge2mqtt.core.logging.models import LoggingLevelEnum
+
 
 class MQTTClientArgs(BaseModel):
     identifier: str = Field(default="solaredge2mqtt")
@@ -20,7 +22,11 @@ class MQTTSettings(BaseModel):
     topic_prefix: str = Field(default="solaredge")
     use_tls: bool = Field(default=False)
     ca_certs: str | None = Field(default=None)
+    certfile: str | None = Field(default=None)
+    keyfile: str | None = Field(default=None)
+    keyfile_password: SecretStr | None = Field(default=None)
     tls_verify: bool = Field(default=True)
+    logging_level: LoggingLevelEnum = Field(default=LoggingLevelEnum.ERROR)
 
     @property
     def kargs(self) -> dict[str, Any]:
@@ -36,6 +42,13 @@ class MQTTSettings(BaseModel):
         if self.use_tls:
             client_args["tls_params"] = TLSParameters(
                 ca_certs=self.ca_certs,
+                certfile=self.certfile,
+                keyfile=self.keyfile,
+                keyfile_password=(
+                    self.keyfile_password.get_secret_value()
+                    if self.keyfile_password is not None
+                    else None
+                ),
                 cert_reqs=ssl.CERT_REQUIRED if self.tls_verify else ssl.CERT_NONE,
             )
         else:

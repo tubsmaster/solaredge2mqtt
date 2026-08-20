@@ -1,9 +1,9 @@
 import json
 from asyncio import Queue, QueueFull
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, Mapping, Self
 
-from aiomqtt import Client, Message, Will
+from aiomqtt import Client, Message, MqttError, Will
 from pydantic import BaseModel, ValidationError
 
 from solaredge2mqtt.core.events import EventBus
@@ -18,10 +18,12 @@ from solaredge2mqtt.core.mqtt.settings import MQTTSettings
 
 
 class MQTTClient(Client):
-    def __init__(self, settings: MQTTSettings, event_bus: EventBus):
+    def __init__(self, settings: MQTTSettings):
         self.broker = settings.broker
         self.port = settings.port
         self._is_connected = False
+        self._min_log_level = settings.logging_level
+        self._logging_handler_id = None
 
         self.topic_prefix = settings.topic_prefix
 
@@ -39,7 +41,6 @@ class MQTTClient(Client):
 
         self._received_message_queue: Queue[Message] = Queue(maxsize=10)
 
-        self.event_bus = event_bus
         self._subscribe_events()
 
         super().__init__(
@@ -52,6 +53,9 @@ class MQTTClient(Client):
     async def __aenter__(self) -> Self:
         await super().__aenter__()
         self._is_connected = True
+        self._logging_handler_id = logger.add(
+            self.logging_sink, level=self._min_log_level.level, filter=self.log_filter
+        )
         return self
 
     async def __aexit__(
@@ -60,27 +64,32 @@ class MQTTClient(Client):
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
+        if self._logging_handler_id:
+            logger.remove(self._logging_handler_id)
+            self._logging_handler_id = None
+
         self._is_connected = False
         return await super().__aexit__(exc_type, exc_val, exc_tb)
 
     def _subscribe_events(self) -> None:
-        self.event_bus.unsubscribe_all(MQTTPublishEvent)
-        self.event_bus.unsubscribe_all(MQTTSubscribeEvent)
+        EventBus.unsubscribe_all(MQTTPublishEvent)
+        EventBus.unsubscribe_all(MQTTSubscribeEvent)
 
-        self.event_bus.subscribe(MQTTPublishEvent, self.event_listener)
-        self.event_bus.subscribe(MQTTSubscribeEvent, self._subscribe_topic)
+        EventBus.subscribe(MQTTPublishEvent, self.event_listener)
+        EventBus.subscribe(MQTTSubscribeEvent, self._subscribe_topic)
 
     async def _subscribe_topic(self, event: MQTTSubscribeEvent[Any]) -> None:
-        if event.topic not in self._subscribed_topics:
-            logger.info(f"Subscribing to topic: {event.topic}")
-            self._subscribed_topics[event.topic] = event.event()
-            await self.subscribe(event.topic)
+        topic = f"{event.topic_prefix or self.topic_prefix}/{event.topic}"
+        if topic not in self._subscribed_topics:
+            logger.info(f"Subscribing to topic: {topic}")
+            self._subscribed_topics[topic] = event.event()
+            await self.subscribe(topic)
 
     async def listen(self) -> None:
         if self._subscribed_topics:
             async for message in self.messages:
                 topic = str(message.topic)
-                if topic not in self._subscribed_topics:
+                if self._resolve_subscription(topic) is None:
                     logger.warning(f"Received message on unsubscribed topic: {topic}")
                     continue
                 if len(message.payload) > MAX_MQTT_PAYLOAD_SIZE:
@@ -94,6 +103,29 @@ class MQTTClient(Client):
                 except QueueFull:
                     logger.warning("MQTT processing queue full – dropping message")
 
+    async def logging_sink(self, message: Any) -> None:
+        payload = (
+            f"{message.record['time'].isoformat()} | "
+            f"{message.record['level'].name} | "
+            f"{message.record['message']}"
+        )
+
+        try:
+            await self.publish_to(
+                "logging", payload, retain=False, suppress_connection_error=True
+            )
+        except MqttError:
+            pass
+
+    def log_filter(self, record: Mapping[str, Any]) -> bool:
+        record_name = record.get("name")
+        if record_name is not None and record_name.startswith(
+            "solaredge2mqtt.core.mqtt"
+        ):
+            return False
+
+        return True
+
     async def process_queue(self) -> None:
         if self._subscribed_topics:
             while True:
@@ -106,7 +138,7 @@ class MQTTClient(Client):
     async def _handle_message(self, message: Message) -> None:
         topic = str(message.topic)
         try:
-            event = self._subscribed_topics.get(topic)
+            event = self._resolve_subscription(topic)
             if not event:
                 logger.warning(f"Received message for unexpected topic: {topic}")
                 return
@@ -126,15 +158,38 @@ class MQTTClient(Client):
                 logger.warning(f"Received invalid payload type on topic: {topic}")
                 return
 
-            await self.event_bus.emit(event(topic, parsed_input))
+            await EventBus.emit(event(topic, parsed_input))
         except (ValidationError, json.JSONDecodeError, TypeError) as ex:
             logger.warning(f"Received invalid message on topic: {topic}, error: {ex}")
 
-    async def publish_status_online(self) -> None:
-        await self.publish_to("status", "online", True)
+    def _resolve_subscription(self, topic: str) -> type[MQTTReceivedEvent[Any]] | None:
+        event = self._subscribed_topics.get(topic)
+        if event is not None:
+            return event
 
-    async def publish_status_offline(self) -> None:
-        await self.publish_to("status", "offline", True)
+        for pattern, subscribed_event in self._subscribed_topics.items():
+            if ("+" in pattern or "#" in pattern) and self._topic_matches(
+                pattern, topic
+            ):
+                return subscribed_event
+
+        return None
+
+    @staticmethod
+    def _topic_matches(pattern: str, topic: str) -> bool:
+        """Match a concrete topic against an MQTT subscription pattern (+/#)."""
+        pattern_parts = pattern.split("/")
+        topic_parts = topic.split("/")
+
+        for index, part in enumerate(pattern_parts):
+            if part == "#":
+                return True
+            if index >= len(topic_parts):
+                return False
+            if part != "+" and part != topic_parts[index]:
+                return False
+
+        return len(pattern_parts) == len(topic_parts)
 
     async def event_listener(self, event: MQTTPublishEvent) -> None:
         await self.publish_to(
@@ -144,6 +199,7 @@ class MQTTClient(Client):
             event.qos,
             event.topic_prefix,
             event.exclude_none,
+            event.suppress_connection_error,
         )
 
     async def publish_to(
@@ -154,6 +210,7 @@ class MQTTClient(Client):
         qos: int = 1,
         topic_prefix: str | None = None,
         exclude_none: bool = False,
+        suppress_connection_error: bool = False,
     ) -> None:
         if self._is_connected:
             topic = f"{topic_prefix or self.topic_prefix}/{topic}"
@@ -163,7 +220,7 @@ class MQTTClient(Client):
                 payload = payload.model_dump_json(exclude_none=exclude_none)
 
             await self.publish(topic, payload, qos=qos, retain=retain)
-        else:
+        elif not suppress_connection_error:
             logger.warning(
                 f"Cannot publish to topic {topic} – MQTT client not connected"
             )

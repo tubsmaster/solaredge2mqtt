@@ -1,6 +1,5 @@
 import asyncio
-import json
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 
 from aiohttp import ClientResponseError
 
@@ -9,9 +8,20 @@ from solaredge2mqtt.core.exceptions import ConfigurationException, InvalidDataEx
 from solaredge2mqtt.core.influxdb import InfluxDBAsync, Point
 from solaredge2mqtt.core.logging import logger
 from solaredge2mqtt.core.mqtt.events import MQTTPublishEvent
-from solaredge2mqtt.core.timer.events import Interval15MinTriggerEvent
+from solaredge2mqtt.core.timer.events import (
+    Interval5MinTriggerEvent,
+    Interval15MinTriggerEvent,
+)
 from solaredge2mqtt.services.http_async import HTTPClientAsync
+from solaredge2mqtt.services.monitoring.events import (
+    EVChargerChargeLevelEvent,
+    EVChargerChargeLevelSubscribeEvent,
+    EVChargerReadEvent,
+    MonitoringOfflineEvent,
+    MonitoringOnlineEvent,
+)
 from solaredge2mqtt.services.monitoring.models import (
+    EVCharger,
     LogicalInfo,
     LogicalInverter,
     LogicalModule,
@@ -20,8 +30,13 @@ from solaredge2mqtt.services.monitoring.models import (
 from solaredge2mqtt.services.monitoring.settings import MonitoringSettings
 
 LOGIN_URL = "https://monitoring.solaredge.com/solaredge-apigw/api/login"
-LOGICAL_URL = "https://monitoring.solaredge.com/solaredge-apigw/api/sites/{site_id}/layout/logical"
-POWER_PUBLIC_URL = "https://monitoring.solaredge.com/solaredge-web/p/playbackData"
+LOGICAL_URL = "https://monitoring.solaredge.com/services/layout/logical/generic/v2/site/{site_id}?include-optimizers=true"
+ENERGY_BY_INVERTER_URL = (
+    "https://monitoring.solaredge.com/services/layout/energy/site/{site_id}/by-inverter"
+)
+OPTIMIZERS_COMPACT_URL = "https://monitoring.solaredge.com/services/layout/playback/site/{site_id}/optimizers-compact"
+DEVICES_URL = "https://monitoring.solaredge.com/services/api/homeautomation/v1.0/sites/{site_id}/devices"
+CHARGING_CONTROL_URL = "https://monitoring.solaredge.com/services/m/api/homeautomation/v1.0/{site_id}/devices/{device_id}/activationState"
 CONTENT_TYPE_FORM_URLENCODED = "application/x-www-form-urlencoded"
 
 
@@ -29,7 +44,6 @@ class MonitoringSite(HTTPClientAsync):
     def __init__(
         self,
         settings: MonitoringSettings,
-        event_bus: EventBus,
         influxdb: InfluxDBAsync | None,
     ) -> None:
         super().__init__("Monitoring Site")
@@ -37,30 +51,182 @@ class MonitoringSite(HTTPClientAsync):
 
         self.influxdb: InfluxDBAsync | None = influxdb
 
-        self.event_bus = event_bus
-        self._subscribe_events()
+        self.found_evchargers: bool = False
+        self._cached_structure: dict | None = None
 
-    def _subscribe_events(self) -> None:
-        self.event_bus.subscribe(Interval15MinTriggerEvent, self.get_data)
+        EventBus.register(self)
 
+    async def async_init(self) -> None:
+        await self._discover_evchargers()
+        await self._load_structure()
+
+    async def _discover_evchargers(self) -> None:
+        try:
+            headers = await self._add_login_headers()
+
+            async with asyncio.timeout(10):
+                result = await self._get(
+                    DEVICES_URL.format(site_id=self.settings.site_id_secret),
+                    headers=headers,
+                )
+
+            charger_devices = self._extract_evchargers(result)
+            if not charger_devices:
+                logger.info("No controllable EV charger found in monitoring account")
+                return
+
+            self.found_evchargers = True
+
+            for device in charger_devices:
+                charger = EVCharger.from_device(device)
+
+                await EventBus.emit(
+                    EVChargerChargeLevelSubscribeEvent(charger.mqtt_chargelevel_topic())
+                )
+        except (
+            ClientResponseError,
+            asyncio.TimeoutError,
+            ConfigurationException,
+            InvalidDataException,
+        ) as error:
+            logger.warning("Unable to discover EV chargers: {error}", error=error)
+
+    @EventBus.subscribe(Interval5MinTriggerEvent)
+    async def refresh_evchargers(self, event: Interval5MinTriggerEvent) -> None:
+        if not self.found_evchargers:
+            return
+
+        try:
+            headers = await self._add_login_headers()
+
+            async with asyncio.timeout(10):
+                result = await self._get(
+                    DEVICES_URL.format(site_id=self.settings.site_id_secret),
+                    headers=headers,
+                )
+
+            for device in self._extract_evchargers(result):
+                evcharger = EVCharger.from_device(device)
+                await EventBus.emit(EVChargerReadEvent(evcharger))
+                await EventBus.emit(
+                    MQTTPublishEvent(
+                        evcharger.mqtt_topic(), evcharger, self.settings.retain
+                    )
+                )
+
+            await EventBus.emit(MonitoringOnlineEvent(self.settings.debounce_cycles))
+        except (
+            ClientResponseError,
+            asyncio.TimeoutError,
+            ConfigurationException,
+            InvalidDataException,
+        ) as error:
+            logger.warning("Unable to refresh EV charger status: {error}", error=error)
+            await EventBus.emit(MonitoringOfflineEvent())
+
+    @staticmethod
+    def _extract_evchargers(result: object) -> list[dict[str, object]]:
+        if not isinstance(result, dict):
+            return []
+
+        devices_by_type = result.get("devicesByType")
+        if not isinstance(devices_by_type, dict):
+            return []
+
+        chargers = devices_by_type.get("EV_CHARGER", [])
+        if not isinstance(chargers, list):
+            return []
+
+        return [
+            charger
+            for charger in chargers
+            if isinstance(charger, dict) and charger.get("reporterId") is not None
+        ]
+
+    @EventBus.subscribe(EVChargerChargeLevelEvent)
+    async def handle_charge_command(self, event: EVChargerChargeLevelEvent) -> None:
+        topic_parts = event.topic.split("/")
+        try:
+            idx = topic_parts.index("evcharger")
+            reporter_id = int(topic_parts[idx + 1])
+        except (ValueError, IndexError):
+            logger.warning(
+                "Cannot extract device id from EV charger command topic: {topic}",
+                topic=event.topic,
+            )
+            return
+
+        level = event.input.level
+        logger.info(
+            "Requesting EV charger charge level {level}% for device {reporter_id}",
+            level=level,
+            reporter_id=reporter_id,
+        )
+        await self._execute_charge_control(reporter_id, level)
+
+    async def close(self) -> None:
+        await EventBus.emit(MonitoringOfflineEvent())
+        await super().close()
+
+    @EventBus.subscribe(Interval15MinTriggerEvent)
     async def get_data(self, event: Interval15MinTriggerEvent | None) -> None:
+        try:
+            modules = await self.get_modules()
+
+            energy_total = 0
+            count_modules = 0
+
+            await self.save_to_influxdb(modules)
+            await self.publish_mqtt(modules, energy_total, count_modules)
+            await EventBus.emit(MonitoringOnlineEvent(self.settings.debounce_cycles))
+        except (ConfigurationException, InvalidDataException):
+            await EventBus.emit(MonitoringOfflineEvent())
+            raise
+
+    async def get_modules(self) -> dict[str, LogicalModule]:
         energies = await self.get_modules_energy()
         powers = await self.get_modules_power()
 
-        modules = self.merge_modules(energies, powers)
+        return self.merge_modules(energies, powers)
 
-        energy_total = 0
-        count_modules = 0
-
-        await self.save_to_influxdb(modules)
-        await self.publish_mqtt(modules, energy_total, count_modules)
+    async def _load_structure(self) -> None:
+        try:
+            logical = await self._get_logical()
+            site_structure = logical.get("siteStructure")
+            if not isinstance(site_structure, dict):
+                raise InvalidDataException(
+                    "Unexpected response format when reading logical layout"
+                )
+            self._cached_structure = site_structure
+            logger.info("Loaded monitoring site structure")
+        except (
+            ClientResponseError,
+            asyncio.TimeoutError,
+            ConfigurationException,
+            InvalidDataException,
+        ) as error:
+            logger.warning(
+                "Unable to load monitoring site structure: {error}", error=error
+            )
 
     async def get_modules_energy(self) -> dict[str, LogicalModule]:
-        logical = await self._get_logical()
+        if self._cached_structure is None:
+            await self._load_structure()
 
-        inverters = self._parse_inverters(
-            logical["logicalTree"]["children"], logical["reportersData"]
-        )
+        if self._cached_structure is None:
+            raise InvalidDataException("Monitoring site structure is not available")
+
+        site_structure = self._cached_structure
+
+        inverter_serials = [
+            inverter_node["serial"]
+            for inverter_node in self._folder_children(site_structure, "INVERTER")
+            if inverter_node.get("type") == "INVERTER" and inverter_node.get("serial")
+        ]
+
+        energy_by_inverter = await self._get_energy_by_inverter(inverter_serials)
+
+        inverters = self._parse_inverters(site_structure, energy_by_inverter)
 
         modules = {}
 
@@ -76,15 +242,16 @@ class MonitoringSite(HTTPClientAsync):
 
     async def _get_logical(self) -> dict:
         try:
-            token = await self.login()
+            headers = await self._add_login_headers(
+                {
+                    "Content-Type": CONTENT_TYPE_FORM_URLENCODED,
+                }
+            )
 
             async with asyncio.timeout(10):
                 result = await self._get(
                     LOGICAL_URL.format(site_id=self.settings.site_id_secret),
-                    headers={
-                        "Content-Type": CONTENT_TYPE_FORM_URLENCODED,
-                        "X-CSRF-TOKEN": token,
-                    },
+                    headers=headers,
                 )
 
                 if not isinstance(result, dict):
@@ -97,156 +264,253 @@ class MonitoringSite(HTTPClientAsync):
         except (ClientResponseError, asyncio.TimeoutError) as error:
             raise InvalidDataException("Unable to read logical layout") from error
 
-    def _parse_inverters(self, inverter_objs, reporters_data) -> list[LogicalInverter]:
-        inverters = []
+    async def _get_energy_by_inverter(self, inverter_serials: list[str]) -> dict:
+        if not inverter_serials:
+            return {}
 
-        for inverter_obj in inverter_objs:
-            info = LogicalInfo.map(inverter_obj["data"])
-            if "INVERTER" in info["type"]:
-                inverter = LogicalInverter.model_validate(
-                    {
-                        "info": info,
-                        "energy": (
-                            reporters_data[info["identifier"]]["unscaledEnergy"]
-                            if info["identifier"] in reporters_data
-                            else None
-                        ),
-                    }
+        today = datetime.now().astimezone().date().isoformat()
+
+        try:
+            headers = await self._add_login_headers()
+
+            async with asyncio.timeout(10):
+                result = await self._get(
+                    ENERGY_BY_INVERTER_URL.format(site_id=self.settings.site_id_secret),
+                    params={
+                        "start-date": today,
+                        "end-date": today,
+                        "inverter-serials": ",".join(inverter_serials),
+                        "include-max-temperature": "false",
+                        "include-color": "true",
+                    },
+                    headers=headers,
                 )
 
-                self._parse_strings(inverter, inverter_obj["children"], reporters_data)
+            if not isinstance(result, dict):
+                raise InvalidDataException(
+                    "Unexpected response format when reading energy by inverter"
+                )
 
-                inverters.append(inverter)
+            return self._index_energy_by_inverter(result)
 
-            else:
-                logger.info("Unknown inverter type: {type}", type=info["type"])
+        except (ClientResponseError, asyncio.TimeoutError) as error:
+            raise InvalidDataException("Unable to read energy by inverter") from error
+
+    @staticmethod
+    def _index_energy_by_inverter(data: dict) -> dict:
+        index = {}
+
+        for inverter_data in data.get("inverters", []):
+            serial = inverter_data.get("serial")
+            if not serial:
+                continue
+
+            strings_energy: dict[int, float] = {}
+            for string_data in inverter_data.get("strings", []):
+                if not isinstance(string_data, dict):
+                    continue
+                order = string_data.get("stringRelativeOrder")
+                energy = (string_data.get("energy") or {}).get("value")
+                if isinstance(order, int) and energy is not None:
+                    strings_energy[order] = float(energy)
+
+            optimizers_energy: dict[str, float] = {}
+            for optimizer_data in inverter_data.get("optimizers", []):
+                if not isinstance(optimizer_data, dict):
+                    continue
+                optimizer_serial = optimizer_data.get("serial")
+                energy = (optimizer_data.get("energy") or {}).get("value")
+                if optimizer_serial and energy is not None:
+                    optimizers_energy[str(optimizer_serial)] = float(energy)
+
+            inverter_energy = inverter_data.get("energy")
+
+            index[serial] = {
+                "energy": inverter_energy["value"] if inverter_energy else None,
+                "strings": strings_energy,
+                "optimizers": optimizers_energy,
+            }
+
+        return index
+
+    @staticmethod
+    def _folder_children(node: dict, folder_name: str) -> list[dict]:
+        for child in node.get("children", []):
+            if child.get("type") == "FOLDER" and child.get("name") == folder_name:
+                return child.get("children", [])
+
+        return []
+
+    def _parse_inverters(
+        self, site_structure: dict, energy_by_inverter: dict
+    ) -> list[LogicalInverter]:
+        inverters = []
+
+        for inverter_node in self._folder_children(site_structure, "INVERTER"):
+            if inverter_node.get("type") != "INVERTER":
+                logger.info(
+                    "Unknown inverter type: {type}", type=inverter_node.get("type")
+                )
+                continue
+
+            info = LogicalInfo.map(inverter_node)
+            inverter_energy = energy_by_inverter.get(inverter_node.get("serial"), {})
+
+            inverter = LogicalInverter.model_validate(
+                {"info": info, "energy": inverter_energy.get("energy")}
+            )
+
+            self._parse_strings(
+                inverter,
+                inverter_node,
+                inverter_energy.get("strings", {}),
+                inverter_energy.get("optimizers", {}),
+            )
+
+            inverters.append(inverter)
 
         return inverters
 
-    def _parse_strings(self, inverter, string_objs, reporters_data):
-        for string_obj in string_objs:
-            info = LogicalInfo.map(string_obj["data"])
-            string = LogicalString.model_validate(
-                {
-                    "info": info,
-                    "energy": (
-                        reporters_data[info["identifier"]]["unscaledEnergy"]
-                        if info["identifier"] in reporters_data
-                        else None
-                    ),
-                },
-            )
+    def _parse_strings(
+        self,
+        inverter,
+        inverter_node: dict,
+        strings_energy: dict,
+        optimizers_energy: dict,
+    ):
+        for string_node in self._folder_children(inverter_node, "STRING"):
+            if string_node.get("type") != "STRING":
+                continue
 
-            self._parse_panels(string, string_obj["children"], reporters_data)
+            info = LogicalInfo.map(string_node)
+            energy = strings_energy.get(string_node.get("order"))
+
+            string = LogicalString.model_validate({"info": info, "energy": energy})
+
+            self._parse_panels(string, string_node, optimizers_energy)
 
             inverter.strings.append(string)
 
-    def _parse_panels(self, string, panel_objs, reporters_data):
-        for panel_obj in panel_objs:
-            info = LogicalInfo.map(panel_obj["data"])
-            panel = LogicalModule.model_validate(
-                {
-                    "info": info,
-                    "energy": (
-                        reporters_data[info["identifier"]]["unscaledEnergy"]
-                        if info["identifier"] in reporters_data
-                        else None
-                    ),
-                },
-            )
+    def _parse_panels(self, string, string_node: dict, optimizers_energy: dict):
+        for optimizer_node in self._folder_children(string_node, "OPTIMIZER"):
+            if optimizer_node.get("type") != "OPTIMIZER":
+                continue
+
+            info = LogicalInfo.map(optimizer_node)
+            energy = optimizers_energy.get(optimizer_node.get("serial"))
+
+            panel = LogicalModule.model_validate({"info": info, "energy": energy})
 
             string.modules.append(panel)
 
     async def get_modules_power(self) -> dict[str, dict[datetime, float]]:
-        playback = await self._get_playback()
+        today = datetime.now().astimezone().date()
 
-        modules = {}
+        try:
+            headers = await self._add_login_headers()
 
-        for date_str, reporters_data in playback["reportersData"].items():
-            date = datetime.strptime(date_str, "%a %b %d %H:%M:%S GMT %Y").astimezone()
+            async with asyncio.timeout(10):
+                result = await self._get(
+                    OPTIMIZERS_COMPACT_URL.format(site_id=self.settings.site_id_secret),
+                    params={
+                        "resolution": "hours",
+                        "start-date": f"{today.isoformat()}T00:00:00Z",
+                        "end-date": f"{today.isoformat()}T23:59:59Z",
+                    },
+                    headers=headers,
+                )
 
-            for entries in reporters_data.values():
-                for entry in entries:
-                    key = entry["key"]
-                    if key not in modules:
-                        modules[key] = {}
+            if not isinstance(result, dict):
+                raise InvalidDataException(
+                    "Unexpected response format when reading optimizer power data"
+                )
 
-                    modules[key][date] = float(entry["value"])
+            modules = self._decode_optimizers_compact(result, today)
 
-        logger.debug(modules)
+            logger.debug(modules)
+
+            return modules
+        except (ClientResponseError, asyncio.TimeoutError) as error:
+            raise InvalidDataException("Unable to read optimizer power data") from error
+
+    @staticmethod
+    def _decode_optimizers_compact(
+        data: dict, day: date
+    ) -> dict[str, dict[datetime, float]]:
+        serials = data.get("optimizerSerials", [])
+        slots = data.get("timeSlotsCount", 0)
+        power_values = data.get("compressPowerData", [])
+
+        if not isinstance(serials, list) or not serials:
+            return {}
+
+        if not isinstance(slots, int) or slots <= 0 or slots > 24:
+            return {}
+
+        if not isinstance(power_values, list) or len(power_values) < 2:
+            return {}
+
+        payload_start = int(power_values[1])
+        payload_end = payload_start + len(serials) * slots
+        if payload_start < 0 or payload_end > len(power_values):
+            return {}
+
+        modules: dict[str, dict[datetime, float]] = {}
+
+        for index, serial in enumerate(serials):
+            start = payload_start + index * slots
+            values = power_values[start : start + slots]
+
+            modules[str(serial)] = {
+                datetime.combine(day, time(hour=hour)).astimezone(): float(value)
+                for hour, value in enumerate(values)
+            }
 
         return modules
 
-    async def _get_playback(self) -> dict:
-        try:
-            token = await self.login()
-
-            async with asyncio.timeout(10):
-                playback_data = await self._post(
-                    POWER_PUBLIC_URL,
-                    data={
-                        "fieldId": self.settings.site_id_secret,
-                        "timeUnit": str(4),
-                        "CSRF": token,
-                    },
-                    headers={
-                        "Content-Type": CONTENT_TYPE_FORM_URLENCODED,
-                        "X-CSRF-TOKEN": token,
-                    },
-                    expect_json=False,
-                )
-
-            if not isinstance(playback_data, str):
-                raise InvalidDataException(
-                    "Unexpected response format when reading playback data"
-                )
-
-            response = (
-                playback_data.replace("'", '"')
-                .replace("Array", "")
-                .replace("key", '"key"')
-                .replace("value", '"value"')
-                .replace("timeUnit", '"timeUnit"')
-                .replace("fieldData", '"fieldData"')
-                .replace("reportersData", '"reportersData"')
+    async def _execute_charge_control(self, device_id: int, level: int) -> None:
+        if not self.settings.is_configured:
+            logger.warning(
+                "Cannot control EV charger charging: monitoring account not configured"
             )
+            return
 
-            return json.loads(response)
-        except (ClientResponseError, asyncio.TimeoutError) as error:
-            raise InvalidDataException("Unable to read logical layout") from error
-
-    async def login(self) -> str:
         try:
-            token = self.get_cookie("CSRF-TOKEN")
-
-            if token is not None:
-                return token
+            headers = await self._add_login_headers()
 
             async with asyncio.timeout(10):
-                await self._post(
-                    LOGIN_URL,
-                    headers={"Content-Type": CONTENT_TYPE_FORM_URLENCODED},
-                    data={
-                        "j_username": self.settings.username_value,
-                        "j_password": self.settings.password_secret,
+                result = await self._put(
+                    CHARGING_CONTROL_URL.format(
+                        site_id=self.settings.site_id_secret,
+                        device_id=device_id,
+                    ),
+                    json={
+                        "mode": "MANUAL",
+                        "level": level,
+                        "duration": None,
                     },
-                    expect_json=False,
+                    headers=headers,
                 )
 
-            token = self.get_cookie("CSRF-TOKEN")
-
-            if token is None:
-                raise ConfigurationException(
-                    "Monitoring",
-                    "Login to monitoring account failed, CSRF token not found",
+            if isinstance(result, dict) and result.get("status") == "PASSED":
+                logger.info(
+                    "EV charger level set to {level}% (device {device_id})",
+                    level=level,
+                    device_id=device_id,
                 )
-
-            logger.info("Login to monitoring site successful")
-            return token
-        except (ClientResponseError, asyncio.TimeoutError) as error:
-            raise ConfigurationException(
-                "Monitoring", "Unable to login to monitoring account"
-            ) from error
+            else:
+                logger.warning(
+                    "EV charger level control was not accepted: {result}", result=result
+                )
+        except (
+            ClientResponseError,
+            asyncio.TimeoutError,
+            ConfigurationException,
+            InvalidDataException,
+        ) as error:
+            logger.warning(
+                "Unable to control EV charger charging: {error}", error=error
+            )
 
     @staticmethod
     def merge_modules(
@@ -284,7 +548,7 @@ class MonitoringSite(HTTPClientAsync):
                 count_modules += 1
                 energy_total += module.energy
 
-            await self.event_bus.emit(
+            await EventBus.emit(
                 MQTTPublishEvent(
                     f"monitoring/module/{module.info.serialnumber}",
                     module,
@@ -299,10 +563,57 @@ class MonitoringSite(HTTPClientAsync):
             count_modules=count_modules,
         )
 
-        await self.event_bus.emit(
+        await EventBus.emit(
             MQTTPublishEvent(
                 "monitoring/pv_energy_today",
                 energy_total,
                 self.settings.retain,
             )
         )
+
+    async def _add_login_headers(
+        self, headers: dict[str, str] | None = None
+    ) -> dict[str, str]:
+        token, remember_me_cookie = await self.login()
+
+        merged_headers = dict(headers) if headers else {}
+        merged_headers["X-CSRF-TOKEN"] = token
+        merged_headers["Cookie"] = (
+            f"SPRING_SECURITY_REMEMBER_ME_COOKIE={remember_me_cookie}"
+        )
+        return merged_headers
+
+    async def login(self) -> tuple[str, str]:
+        try:
+            token = self.get_cookie("CSRF-TOKEN")
+            remember_me_cookie = self.get_cookie("SPRING_SECURITY_REMEMBER_ME_COOKIE")
+
+            if token and remember_me_cookie:
+                return token, remember_me_cookie
+
+            async with asyncio.timeout(10):
+                await self._post(
+                    LOGIN_URL,
+                    headers={"Content-Type": CONTENT_TYPE_FORM_URLENCODED},
+                    data={
+                        "j_username": self.settings.username_value,
+                        "j_password": self.settings.password_secret,
+                    },
+                    expect_json=False,
+                )
+
+            token = self.get_cookie("CSRF-TOKEN")
+            remember_me_cookie = self.get_cookie("SPRING_SECURITY_REMEMBER_ME_COOKIE")
+
+            if not (token and remember_me_cookie):
+                raise ConfigurationException(
+                    "Monitoring",
+                    "Login to monitoring account failed.",
+                )
+
+            logger.info("Login to monitoring site successful")
+            return token, remember_me_cookie
+        except (ClientResponseError, asyncio.TimeoutError) as error:
+            raise ConfigurationException(
+                "Monitoring", "Unable to login to monitoring account"
+            ) from error

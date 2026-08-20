@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 from solaredge2mqtt.core.events import EventBus
 from solaredge2mqtt.core.logging import logger
 from solaredge2mqtt.core.mqtt.events import (
     MQTTPublishEvent,
+)
+from solaredge2mqtt.core.status.events import ResendStatusEvent
+from solaredge2mqtt.core.timer.events import (
+    BetweenIntervalTriggerEvent,
 )
 from solaredge2mqtt.services.energy.events import EnergyReadEvent
 from solaredge2mqtt.services.forecast.events import ForecastEvent
@@ -25,6 +30,7 @@ from solaredge2mqtt.services.homeassistant.models import (
 from solaredge2mqtt.services.modbus.events import ModbusUnitsReadEvent
 from solaredge2mqtt.services.modbus.models.inverter import ModbusInverter
 from solaredge2mqtt.services.models import Component
+from solaredge2mqtt.services.monitoring.events import EVChargerReadEvent
 from solaredge2mqtt.services.powerflow.events import PowerflowGeneratedEvent
 from solaredge2mqtt.services.wallbox.events import WallboxReadEvent
 
@@ -33,57 +39,45 @@ if TYPE_CHECKING:
 
 
 class HomeAssistantDiscovery:
-    def __init__(self, service_settings: ServiceSettings, event_bus: EventBus) -> None:
+    def __init__(self, service_settings: ServiceSettings) -> None:
         self.settings = service_settings
 
         self._send_entities: dict[str, HomeAssistantEntity] = {}
         logger.info("Home Assistant discovery enabled")
 
-        self._status_topic = f"{self.settings.homeassistant.topic_prefix}/status"
+        self._seen_component_topics: set[str] = set()
 
-        self._seen_energy_periods: set[str] = set()
-
-        self.event_bus = event_bus
-        self._subscribe_events()
-
-    def _subscribe_events(self) -> None:
-        self.event_bus.subscribe(
-            [
-                ForecastEvent,
-                EnergyReadEvent,
-                WallboxReadEvent,
-            ],
-            self.component_discovery,
-        )
-
-        self.event_bus.subscribe(PowerflowGeneratedEvent, self.powerflow_discovery)
-
-        self.event_bus.subscribe(ModbusUnitsReadEvent, self.units_discovery)
-
-        self.event_bus.subscribe(
-            HomeAssistantStatusEvent,
-            self.homeassistant_status,
-        )
+        EventBus.register(self)
 
     async def async_init(self) -> None:
-        await self.event_bus.emit(
+        await EventBus.emit(
             HomeAssistantSubscribeEvent(
-                self._status_topic,
+                "status",
+                topic_prefix=self.settings.homeassistant.topic_prefix,
             )
         )
 
+    @EventBus.subscribe(
+        [
+            ForecastEvent,
+            EnergyReadEvent,
+            WallboxReadEvent,
+            EVChargerReadEvent,
+        ]
+    )
     async def component_discovery(
-        self, event: ForecastEvent | EnergyReadEvent | WallboxReadEvent
+        self,
+        event: ForecastEvent | EnergyReadEvent | WallboxReadEvent | EVChargerReadEvent,
     ) -> None:
         publish = True
-        if isinstance(event, EnergyReadEvent):
-            period = event.component.info.period
-            publish = period.auto_discovery and (
-                event.component.mqtt_topic() not in self._seen_energy_periods
-            )
-            self._seen_energy_periods.add(event.component.mqtt_topic())
+        if isinstance(event, (EnergyReadEvent, EVChargerReadEvent)):
+            topic = event.component.mqtt_topic()
+            publish = topic not in self._seen_component_topics
+            if publish and isinstance(event, EnergyReadEvent):
+                publish = publish and event.component.info.period.auto_discovery
+            self._seen_component_topics.add(topic)
         else:
-            self.event_bus.unsubscribe(event, self.component_discovery)
+            EventBus.unsubscribe(event, self.component_discovery)
 
         if publish:
             logger.info(f"Home Assistant discovery component: {event.component}")
@@ -91,8 +85,9 @@ class HomeAssistantDiscovery:
             state_topic = self.state_topic(event.component.mqtt_topic())
             await self.publish_component(event.component, device_info, state_topic)
 
+    @EventBus.subscribe(ModbusUnitsReadEvent)
     async def units_discovery(self, event: ModbusUnitsReadEvent) -> None:
-        self.event_bus.unsubscribe(event, self.units_discovery)
+        EventBus.unsubscribe(event, self.units_discovery)
         for unit_key, unit in event.units.items():
             logger.info(f"Home Assistant discovery {unit_key}:inverter")
 
@@ -112,8 +107,9 @@ class HomeAssistantDiscovery:
                 )
                 await self.publish_component(component, device_info, state_topic)
 
+    @EventBus.subscribe(PowerflowGeneratedEvent)
     async def powerflow_discovery(self, event: PowerflowGeneratedEvent) -> None:
-        self.event_bus.unsubscribe(event, self.powerflow_discovery)
+        EventBus.unsubscribe(event, self.powerflow_discovery)
 
         for key, powerflow in event.components.items():
             logger.info(f"Home Assistant discovery {key}:powerflow")
@@ -136,6 +132,7 @@ class HomeAssistantDiscovery:
         device = HomeAssistantDevice(
             client_id=self.settings.mqtt.client_id,
             state_topic=state_topic,
+            availability_topic=self.availability_topic(component),
             **device_info,
         )
         logger.debug(device)
@@ -175,7 +172,7 @@ class HomeAssistantDiscovery:
 
             self._send_entities[topic] = entity
 
-            await self.event_bus.emit(
+            await EventBus.emit(
                 MQTTPublishEvent(
                     topic=topic,
                     payload=entity,
@@ -185,11 +182,22 @@ class HomeAssistantDiscovery:
                 )
             )
 
+    def availability_topic(self, component: Component) -> str:
+        topic = f"{self.settings.mqtt.topic_prefix}/status"
+        service_name = component.AVAILABILITY_SERVICE
+        if service_name:
+            topic += f"/{service_name}"
+        return topic
+
+    @EventBus.subscribe(HomeAssistantStatusEvent)
     async def homeassistant_status(self, event: HomeAssistantStatusEvent) -> None:
+        expected_topic = f"{self.settings.homeassistant.topic_prefix}/status"
+        if event.topic != expected_topic:
+            return
         if event.input.status == HomeAssistantStatus.ONLINE:
             logger.info("Home Assistant status changed to online resend discovery")
             for topic, entity in self._send_entities.items():
-                await self.event_bus.emit(
+                await EventBus.emit(
                     MQTTPublishEvent(
                         topic=topic,
                         payload=entity,
@@ -198,6 +206,15 @@ class HomeAssistantDiscovery:
                         exclude_none=True,
                     )
                 )
+
+            resend_delay_seconds = 10
+            await asyncio.sleep(resend_delay_seconds)
+
+            logger.info("Resending long interval triggered data to Home Assistant")
+            await EventBus.emit(BetweenIntervalTriggerEvent())
+
+            await asyncio.sleep(resend_delay_seconds)
+            await EventBus.emit(ResendStatusEvent())
 
     @staticmethod
     def property_parser(prop, name: str, path: list[str]) -> dict | None:

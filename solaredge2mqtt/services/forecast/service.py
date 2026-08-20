@@ -48,13 +48,10 @@ class ForecastService:
         self,
         settings: ForecastSettings,
         location: LocationSettings,
-        event_bus: EventBus,
         influxdb: InfluxDBAsync,
     ) -> None:
         self.settings = settings
         self.location = location
-        self.event_bus = event_bus
-        self._subscribe_events()
 
         self.influxdb = influxdb
 
@@ -65,10 +62,9 @@ class ForecastService:
         self.last_weather_forecast: list[OpenWeatherMapForecastData] | None = None
         self.last_hour_forecast: dict[int, OpenWeatherMapForecastData] | None = None
 
-    def _subscribe_events(self) -> None:
-        self.event_bus.subscribe(WeatherUpdateEvent, self.weather_update)
-        self.event_bus.subscribe(Interval10MinTriggerEvent, self.forecast_loop)
+        EventBus.register(self)
 
+    @EventBus.subscribe(WeatherUpdateEvent)
     async def weather_update(self, event: WeatherUpdateEvent) -> None:
         self.last_weather_forecast = event.weather.hourly
 
@@ -145,6 +141,7 @@ class ForecastService:
         for forecaster in self.forecasters.values():
             forecaster.train(data)
 
+    @EventBus.subscribe(Interval10MinTriggerEvent)
     async def forecast_loop(self, event: Interval10MinTriggerEvent) -> None:
         if (
             not self.forecasters[ForecasterType.ENERGY].is_trained
@@ -230,14 +227,14 @@ class ForecastService:
             forecast = Forecast(power_period=power_hours, energy_period=energy_hours)
             logger.debug(forecast)
 
-            await self.event_bus.emit(
+            await EventBus.emit(
                 MQTTPublishEvent(
                     forecast.mqtt_topic(),
                     forecast,
                     self.settings.retain,
                 )
             )
-            await self.event_bus.emit(ForecastEvent(forecast))
+            await EventBus.emit(ForecastEvent(forecast))
 
 
 class Forecaster:
@@ -331,7 +328,9 @@ class Forecaster:
 
         logger.info(f"Training execution time: {execution_time:.2f} seconds")
 
-    def _prepare_model_pipeline(self, x_vector_columns: list[str]) -> Pipeline:
+    def _prepare_model_pipeline(
+        self, x_vector_columns: list[str], n_repeats: int = 10
+    ) -> Pipeline:
         base_estimator = HistGradientBoostingRegressor(
             random_state=42,
             categorical_features="from_dtype",
@@ -343,7 +342,7 @@ class Forecaster:
                 ("preprocessor", self._prepare_preprocessor(x_vector_columns)),
                 (
                     "feature_selector",
-                    PFISelector(estimator=clone(base_estimator)),
+                    PFISelector(estimator=clone(base_estimator), n_repeats=n_repeats),
                 ),
                 ("model", clone(base_estimator)),
             ],
@@ -474,10 +473,11 @@ class PFISelector(BaseEstimator, TransformerMixin):
 
         threshold_value = percentile(self.feature_importances_, 75)
 
-        important_indices = cast(
-            list[bool],
-            (self.feature_importances_ > threshold_value).tolist(),
-        )
+        selected = self.feature_importances_ > threshold_value
+        if not selected.any():
+            selected = self.feature_importances_ >= threshold_value
+
+        important_indices = cast(list[bool], selected.tolist())
         self.important_indices_ = important_indices
         self.important_features_ = [
             col

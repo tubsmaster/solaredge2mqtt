@@ -6,11 +6,187 @@ import pytest
 
 from solaredge2mqtt.core.exceptions import InvalidDataException
 from solaredge2mqtt.services.monitoring.models import (
+    EVCharger,
+    EVChargerInfo,
     LogicalInfo,
     LogicalInverter,
     LogicalModule,
     LogicalString,
 )
+
+SAMPLE_INFO = EVChargerInfo(
+    manufacturer="Keba AG",
+    model="P30",
+    version="1.2.3",
+    serialnumber="SN123456",
+    name="EV Charger",
+    reporter_id=12345,
+)
+
+
+def make_charger_device(**overrides) -> dict:
+    base = {
+        "manufacturer": "Keba AG",
+        "model": "P30",
+        "swVersion": "1.2.3",
+        "serialNumber": "SN123456",
+        "name": "EV Charger",
+        "reporterId": 12345,
+        "chargerStatus": "READY",
+        "connectionStatus": "CONNECTED",
+        "sessionActive": True,
+        "sessionEnergy": 5000,
+        "ratedPower": 11000.0,
+        "actionOperationDetails": [],
+    }
+    base.update(overrides)
+    return base
+
+
+def make_evcharger(
+    info: EVChargerInfo = SAMPLE_INFO,
+    charge_level: int = 0,
+    charger_status: str = "READY",
+    connected: bool = True,
+    session_energy: int = 5000,
+    rated_power: float = 11000.0,
+) -> EVCharger:
+    return EVCharger(
+        info=info,
+        charge_level=charge_level,
+        charger_status=charger_status,
+        connected=connected,
+        session_energy=session_energy,
+        rated_power=rated_power,
+    )
+
+
+class TestEVChargerInfo:
+    """Tests for EVChargerInfo model."""
+
+    def test_from_device(self):
+        device = {
+            "manufacturer": "Keba AG",
+            "model": "P30",
+            "swVersion": "1.2.3",
+            "serialNumber": "SN123456",
+            "name": "EV Charger",
+            "reporterId": 385723326674278,
+        }
+        info = EVChargerInfo.from_device(device)
+        assert info.manufacturer == "Keba AG"
+        assert info.model == "P30"
+        assert info.version == "1.2.3"
+        assert info.serialnumber == "SN123456"
+        assert info.name == "EV Charger"
+        assert info.reporter_id == 385723326674278
+
+    def test_from_device_missing_key_raises(self):
+        with pytest.raises(InvalidDataException):
+            EVChargerInfo.from_device({"manufacturer": "X"})
+
+    def test_homeassistant_device_info(self):
+        info = EVChargerInfo(
+            manufacturer="Keba AG",
+            model="P30",
+            version="1.2.3",
+            serialnumber="SN123456",
+            name="EV Charger",
+            reporter_id=12345,
+        )
+        result = info.homeassistant_device_info()
+        assert result == {
+            "name": "EV Charger",
+            "manufacturer": "Keba AG",
+            "model": "P30",
+            "sw_version": "1.2.3",
+            "serial_number": "SN123456",
+        }
+
+
+class TestEVCharger:
+    """Tests for EVCharger component model."""
+
+    def test_from_device_action_op_off_gives_charge_level_100(self):
+        device = make_charger_device(
+            actionOperationDetails=[{"actionOp": "OFF", "actionText": "STOP_CHARGING"}]
+        )
+        charger = EVCharger.from_device(device)
+        assert charger.charge_level == 100
+
+    def test_from_device_action_op_on_gives_charge_level_0(self):
+        device = make_charger_device(
+            actionOperationDetails=[{"actionOp": "ON", "actionText": "START_CHARGING"}]
+        )
+        charger = EVCharger.from_device(device)
+        assert charger.charge_level == 0
+
+    def test_from_device_no_action_op_details_gives_charge_level_0(self):
+        device = make_charger_device(actionOperationDetails=[])
+        charger = EVCharger.from_device(device)
+        assert charger.charge_level == 0
+
+    def test_from_device_connected_via_connection_status(self):
+        device = make_charger_device(connectionStatus="CONNECTED", sessionActive=False)
+        charger = EVCharger.from_device(device)
+        assert charger.connected is True
+
+    def test_from_device_connected_via_session_active(self):
+        device = make_charger_device(
+            connectionStatus="DISCONNECTED", sessionActive=True
+        )
+        charger = EVCharger.from_device(device)
+        assert charger.connected is True
+
+    def test_from_device_not_connected(self):
+        device = make_charger_device(
+            connectionStatus="DISCONNECTED", sessionActive=False
+        )
+        charger = EVCharger.from_device(device)
+        assert charger.connected is False
+
+    def test_from_device_missing_key_raises(self):
+        device = {
+            "manufacturer": "Keba AG",
+            "model": "P30",
+            "swVersion": "1.2.3",
+            "serialNumber": "SN123456",
+            "name": "EV Charger",
+            "reporterId": 12345,
+        }
+        with pytest.raises(InvalidDataException):
+            EVCharger.from_device(device)
+
+    def test_mqtt_topic(self):
+        charger = make_evcharger()
+        assert charger.mqtt_topic() == "monitoring/evcharger/12345"
+
+    def test_mqtt_chargelevel_topic(self):
+        charger = make_evcharger()
+        assert (
+            charger.mqtt_chargelevel_topic()
+            == "monitoring/evcharger/12345/charge_level"
+        )
+
+    def test_homeassistant_device_info_delegates_to_info(self):
+        charger = make_evcharger()
+        assert (
+            charger.homeassistant_device_info()
+            == SAMPLE_INFO.homeassistant_device_info()
+        )
+
+    def test_serialize_connected_true(self):
+        charger = make_evcharger(connected=True)
+        assert charger.serialize_connected(True) == "true"
+
+    def test_serialize_connected_false(self):
+        charger = make_evcharger(connected=False)
+        assert charger.serialize_connected(False) == "false"
+
+    def test_connected_serialized_as_string_in_json(self):
+        charger = make_evcharger(connected=True)
+        dumped = charger.model_dump()
+        assert dumped["connected"] == "true"
 
 
 class TestLogicalInfo:
@@ -44,10 +220,11 @@ class TestLogicalInfo:
     def test_logical_info_map_method(self):
         """Test LogicalInfo.map static method."""
         data = {
-            "id": 789,
-            "serialNumber": "SN789",
+            "serial": "SN789",
             "name": "Inverter 1",
+            "displayOrder": "1",
             "type": "INVERTER",
+            "properties": {"identifier": "789"},
         }
 
         result = LogicalInfo.map(data)
@@ -57,24 +234,68 @@ class TestLogicalInfo:
         assert result["name"] == "Inverter 1"
         assert result["type"] == "INVERTER"
 
-    def test_logical_info_map_method_string_id(self):
-        """Test LogicalInfo.map converts numeric id to string."""
+    def test_logical_info_map_method_numeric_identifier(self):
+        """Test LogicalInfo.map converts numeric identifier to string."""
         data = {
-            "id": 12345,
-            "serialNumber": "SN001",
+            "serial": "SN001",
             "name": "Test",
-            "type": "MODULE",
+            "displayOrder": "1.2.1",
+            "type": "OPTIMIZER",
+            "properties": {"identifier": 12345},
         }
 
         result = LogicalInfo.map(data)
 
         assert isinstance(result["identifier"], str)
         assert result["identifier"] == "12345"
+        assert result["name"] == "Module 1.2.1"
+
+    def test_logical_info_map_method_no_serial(self):
+        """Test LogicalInfo.map handles nodes with no top-level serial (e.g. STRING)."""
+        data = {
+            "name": "String 1.2",
+            "displayOrder": "1.2",
+            "type": "STRING",
+            "properties": {"identifier": "7B0756CB_32"},
+        }
+
+        result = LogicalInfo.map(data)
+
+        assert result["identifier"] == "7B0756CB_32"
+        assert result["serialnumber"] is None
+        assert result["name"] == "String 1.2"
+
+    def test_logical_info_map_method_falls_back_to_name_without_display_order(self):
+        """Test LogicalInfo.map falls back to name when displayOrder is missing."""
+        data = {
+            "name": "Inverter 1",
+            "type": "INVERTER",
+            "properties": {"identifier": "789"},
+        }
+
+        result = LogicalInfo.map(data)
+
+        assert result["name"] == "Inverter 1"
 
     def test_logical_info_map_invalid_input_raises(self):
         """Test LogicalInfo.map raises on non-dict data."""
         with pytest.raises(InvalidDataException):
             LogicalInfo.map("invalid")
+
+    def test_logical_info_map_missing_properties_raises(self):
+        """Test LogicalInfo.map raises when properties/identifier is missing."""
+        with pytest.raises(InvalidDataException):
+            LogicalInfo.map({"name": "Test", "type": "INVERTER"})
+
+    def test_logical_info_map_missing_type_raises(self):
+        """Test LogicalInfo.map raises when type is missing."""
+        with pytest.raises(InvalidDataException):
+            LogicalInfo.map({"name": "Test", "properties": {"identifier": "1"}})
+
+    def test_logical_info_map_missing_name_raises(self):
+        """Test LogicalInfo.map raises when name is missing."""
+        with pytest.raises(InvalidDataException):
+            LogicalInfo.map({"type": "INVERTER", "properties": {"identifier": "1"}})
 
 
 class TestLogicalInverter:

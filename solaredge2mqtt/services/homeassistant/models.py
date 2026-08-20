@@ -51,6 +51,7 @@ class HomeAssistantBaseModel(BaseModel):
 class HomeAssistantDevice(HomeAssistantBaseModel):
     name: str
     state_topic: str = Field(exclude=True)
+    availability_topic: str | None = Field(default=None, exclude=True)
     manufacturer: str | None = Field(default=None)
     model: str | None = Field(default=None)
     hw_version: str | None = Field(default=None)
@@ -166,6 +167,7 @@ class HomeAssistantBinarySensorType(HomeAssistantEntityBaseType):
 
 class HomeAssistantNumberType(HomeAssistantEntityBaseType):
     ACTIVE_POWER_LIMIT = "active_power_limit", None, "%", 0, 100, 1, "slider"
+    EV_CHARGE_LEVEL = "charge_level", None, "%", 0, 100, 100, "slider"
 
     def __init__(
         self,
@@ -213,7 +215,13 @@ class HomeAssistantSensorType(HomeAssistantEntityBaseType):
     BATTERY = "battery", "battery", "measurement", "%"
     CURRENT_A = "current_a", "current", "measurement", "A"
     ENERGY_KWH = "energy_kwh", "energy", "total_increasing", "kWh"
-    ENERGY_WH = "energy_wh", "energy", "total_increasing", "Wh"
+    ENERGY_WH = (
+        "energy_wh",
+        "energy",
+        "total_increasing",
+        "Wh",
+    )
+    ENERGY_MEASUREMENT_WH = "energy_measurement_wh", "energy", "measurement", "Wh"
     FREQUENCY_HZ = "frequency_hz", "frequency", "measurement", "Hz"
     MONETARY = "monetary", "monetary", "total", None
     MONETARY_BALANCE = "monetary_balance", "monetary", None, None
@@ -289,6 +297,11 @@ class HomeAssistantEntity(HomeAssistantBaseModel):
     @property
     def state_topic(self) -> str:
         return self.device.state_topic
+
+    @computed_field
+    @property
+    def availability_topic(self) -> str | None:
+        return self.device.availability_topic
 
     @computed_field
     @property

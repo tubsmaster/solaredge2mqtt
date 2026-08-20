@@ -19,6 +19,7 @@ modbus:
   port: 1502           # Port of your inverter
   timeout: 1           # Timeout for the modbus connection in seconds
   unit: 1              # Modbus unit address
+  # debounce_cycles: 2  # Optional: consecutive checks before switching online/offline
   
   # Enable or disable detection of meters
   # meter0 is typically the export/import meter (default: true)
@@ -38,12 +39,28 @@ modbus:
   
   # Advanced power controls (enabled, disabled, or disable)
   advanced_power_controls: disabled
-  
-  # Follower inverters (for cascading setups)
+
+  # Startup device detection retry (retries indefinitely on failure)
+  # startup_retry_delay: 30      # Initial delay between retries in seconds
+  # startup_retry_max_delay: 300 # Delay is doubled after each retry, capped here
+
+  # Follower inverters
+  # Cascaded (shared RS485 bus — all units use the leader's TCP connection):
   # follower:
-  #   - unit: 2
+  #   - unit: 2                          # Modbus device address on the bus
   #     meter: [false, false, false]
   #     battery: [false, false]
+  #   - unit: 3
+  #     meter: [true, false, false]
+  #     battery: [true, false]
+  #
+  # Physically separate inverters (each with its own IP/port):
+  # follower:
+  #   - unit: 1
+  #     host: 192.168.1.101              # Own IP; omit to share the leader's connection
+  #     # port: 1502                     # Own port; omit to inherit the leader's port
+  #     meter: [true, false, false]
+  #     battery: [true, false]
 
 # MQTT configuration (required)
 mqtt:
@@ -56,7 +73,11 @@ mqtt:
   retain: false                 # Retain MQTT messages
 # use_tls: false                # MQTT over TLS
 # ca_certs: path_to_CA          # Path to trusted CA boundle - usefull for self sign certificates
+# certfile: path_to_client_cert # Client certificate, for brokers requiring mutual TLS
+# keyfile: path_to_client_key   # Private key matching certfile
+# keyfile_password: !secret mqtt_keyfile_password  # Only if the private key is encrypted
 # tls_verify: true              # Verify mqtt certificate. If set to false ignore certificate expiration, CN missmatch, etc.
+# logging_level: ERROR          # Minimum log level forwarded to MQTT logging topic (default: ERROR)
 
 # Powerflow configuration
 powerflow:
@@ -78,6 +99,7 @@ prices:
 #   username: "user@example.com"
 #   password: !secret monitoring_password  # Reference to secrets.yml
 #   retain: false
+#   debounce_cycles: 2  # Optional: consecutive checks before switching online/offline
 
 # SolarEdge Wallbox (optional)
 # wallbox:
@@ -85,6 +107,7 @@ prices:
 #   password: !secret wallbox_password  # Reference to secrets.yml
 #   serial: !secret wallbox_serial  # Reference to secrets.yml
 #   retain: false
+#   debounce_cycles: 2  # Optional: consecutive checks before switching online/offline
 
 # Home Assistant Auto Discovery (optional)
 # homeassistant:
@@ -101,12 +124,14 @@ prices:
 #   bucket: solaredge
 #   retention: 63072000      # Retention for aggregated data in seconds (2 years)
 #   retention_raw: 25        # Retention for raw data in hours
+#   debounce_cycles: 2  # Optional: consecutive checks before switching online/offline
 
 # Weather configuration (optional, requires location)
 # weather:
 #   api_key: !secret weather_api_key  # Reference to secrets.yml
 #   language: en
 #   retain: false
+#   debounce_cycles: 2  # Optional: consecutive checks before switching online/offline
 
 # Forecast configuration (optional, requires weather and InfluxDB)
 # forecast:

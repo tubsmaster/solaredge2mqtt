@@ -33,14 +33,9 @@ def mock_service_settings():
     mock_unit_settings.battery = [True, False]
 
     settings.modbus.units = {"leader": mock_unit_settings}
+    settings.modbus.debounce_cycles = 0
 
     return settings
-
-
-@pytest.fixture
-def mock_event_bus():
-    """Create mock event bus."""
-    return MagicMock()
 
 
 @pytest.fixture
@@ -218,7 +213,7 @@ class TestDetectMetersExceptionHandling:
     ):
         """Test that _detect_meters skips meter on exception."""
         with patch("solaredge2mqtt.services.modbus.AsyncModbusTcpClient"):
-            modbus = Modbus(mock_service_settings, mock_event_bus)
+            modbus = Modbus(mock_service_settings)
 
             unit_key = "leader"
             unit_settings = mock_service_settings.modbus.units[unit_key]
@@ -233,7 +228,7 @@ class TestDetectMetersExceptionHandling:
 
             # Mock read_device_info to raise exception for meter0
             async def mock_read_device_info(  # noqa: S7503
-                register_class, uk, identifier, us, offset
+                register_class, uk, identifier, us, offset=0
             ):
                 if identifier == "meter0":
                     raise InvalidRegisterDataException(
@@ -260,7 +255,7 @@ class TestDetectMetersExceptionHandling:
     ):
         """Test that other meters are still processed after exception."""
         with patch("solaredge2mqtt.services.modbus.AsyncModbusTcpClient"):
-            modbus = Modbus(mock_service_settings, mock_event_bus)
+            modbus = Modbus(mock_service_settings)
 
             unit_key = "leader"
             unit_settings = mock_service_settings.modbus.units[unit_key]
@@ -277,7 +272,7 @@ class TestDetectMetersExceptionHandling:
             call_count = 0
 
             async def mock_read_device_info(  # noqa: S7503
-                register_class, uk, identifier, us, offset
+                register_class, uk, identifier, us, offset=0
             ):
                 nonlocal call_count
                 call_count += 1
@@ -307,7 +302,7 @@ class TestDetectBatteries:
     async def test_detect_batteries_basic(self, mock_service_settings, mock_event_bus):
         """Test basic battery detection."""
         with patch("solaredge2mqtt.services.modbus.AsyncModbusTcpClient"):
-            modbus = Modbus(mock_service_settings, mock_event_bus)
+            modbus = Modbus(mock_service_settings)
 
             unit_key = "leader"
             unit_settings = mock_service_settings.modbus.units[unit_key]

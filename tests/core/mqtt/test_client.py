@@ -1,6 +1,8 @@
 """Tests for core MQTTClient module with mocking."""
 
 import asyncio
+from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
@@ -54,44 +56,22 @@ def mock_aiomqtt_client():
         yield
 
 
-@pytest.fixture
-def event_bus():
-    """Create an EventBus instance for testing."""
-    from solaredge2mqtt.core.events import EventBus
-
-    return EventBus()
-
-
-@pytest.fixture
-def mock_event_bus():
-    """Create a mock event bus with mocked emit method."""
-    from unittest.mock import AsyncMock, MagicMock
-
-    bus = MagicMock()
-    bus.emit = AsyncMock()
-    bus.subscribe = MagicMock()
-    bus.unsubscribe = MagicMock()
-    bus.unsubscribe_all = MagicMock()
-    return bus
-
-
 class TestMQTTClientInit:
     """Tests for MQTTClient initialization."""
 
-    def test_mqtt_client_init(self, mqtt_settings, event_bus, mock_aiomqtt_client):
+    def test_mqtt_client_init(self, mqtt_settings, mock_aiomqtt_client):
         """Test MQTTClient initialization."""
-        client = MQTTClient(mqtt_settings, event_bus)
+        client = MQTTClient(mqtt_settings)
 
         assert client.broker == "localhost"
         assert client.port == 1883
         assert client.topic_prefix == "test"
-        assert client.event_bus is event_bus
 
     def test_mqtt_client_subscribes_to_events(
         self, mqtt_settings, mock_event_bus, mock_aiomqtt_client
     ):
         """Test MQTTClient subscribes to MQTT events."""
-        client = MQTTClient(mqtt_settings, mock_event_bus)
+        client = MQTTClient(mqtt_settings)
 
         # Verify event subscriptions
         mock_event_bus.subscribe.assert_any_call(
@@ -106,7 +86,7 @@ class TestMQTTClientInit:
         self, mqtt_settings, event_bus, mock_aiomqtt_client
     ):
         """Test __aenter__ marks client as connected."""
-        client = MQTTClient(mqtt_settings, event_bus)
+        client = MQTTClient(mqtt_settings)
 
         with patch(
             "solaredge2mqtt.core.mqtt.Client.__aenter__",
@@ -123,7 +103,7 @@ class TestMQTTClientInit:
         self, mqtt_settings, event_bus, mock_aiomqtt_client
     ):
         """Test __aexit__ marks client as disconnected."""
-        client = MQTTClient(mqtt_settings, event_bus)
+        client = MQTTClient(mqtt_settings)
         client._is_connected = True
 
         with patch(
@@ -132,6 +112,52 @@ class TestMQTTClientInit:
         ) as mock_exit:
             await client.__aexit__(None, None, None)
 
+        assert client._is_connected is False
+        mock_exit.assert_called_once_with(None, None, None)
+
+    @pytest.mark.asyncio
+    async def test_context_manager_exit_removes_logging_handler_when_set(
+        self, mqtt_settings, event_bus, mock_aiomqtt_client
+    ):
+        """Test __aexit__ removes logging handler when one is registered."""
+        client = MQTTClient(mqtt_settings)
+        client._is_connected = True
+        client._logging_handler_id = 123
+
+        with (
+            patch("solaredge2mqtt.core.mqtt.logger.remove") as mock_remove,
+            patch(
+                "solaredge2mqtt.core.mqtt.Client.__aexit__",
+                new=AsyncMock(return_value=None),
+            ) as mock_exit,
+        ):
+            await client.__aexit__(None, None, None)
+
+        mock_remove.assert_called_once_with(123)
+        assert client._logging_handler_id is None
+        assert client._is_connected is False
+        mock_exit.assert_called_once_with(None, None, None)
+
+    @pytest.mark.asyncio
+    async def test_context_manager_exit_skips_logging_handler_remove_when_unset(
+        self, mqtt_settings, event_bus, mock_aiomqtt_client
+    ):
+        """Test __aexit__ does not remove logging handler when none is set."""
+        client = MQTTClient(mqtt_settings)
+        client._is_connected = True
+        client._logging_handler_id = None
+
+        with (
+            patch("solaredge2mqtt.core.mqtt.logger.remove") as mock_remove,
+            patch(
+                "solaredge2mqtt.core.mqtt.Client.__aexit__",
+                new=AsyncMock(return_value=None),
+            ) as mock_exit,
+        ):
+            await client.__aexit__(None, None, None)
+
+        mock_remove.assert_not_called()
+        assert client._logging_handler_id is None
         assert client._is_connected is False
         mock_exit.assert_called_once_with(None, None, None)
 
@@ -144,25 +170,39 @@ class TestMQTTClientSubscribeTopic:
         self, mqtt_settings, event_bus, mock_aiomqtt_client
     ):
         """Test subscribing to a new topic."""
-        client = MQTTClient(mqtt_settings, event_bus)
+        client = MQTTClient(mqtt_settings)
         client.subscribe = AsyncMock()
 
         event = SampleSubscribeEvent("test/topic")
         await client._subscribe_topic(event)
 
-        assert "test/topic" in client._subscribed_topics
-        print(client._subscribed_topics)
-        assert client._subscribed_topics["test/topic"] == SampleInputEvent
-        client.subscribe.assert_called_once_with("test/topic")
+        # The MQTT client centrally prepends the configured topic prefix.
+        assert "test/test/topic" in client._subscribed_topics
+        assert client._subscribed_topics["test/test/topic"] == SampleInputEvent
+        client.subscribe.assert_called_once_with("test/test/topic")
+
+    @pytest.mark.asyncio
+    async def test_subscribe_topic_prefix_override(
+        self, mqtt_settings, event_bus, mock_aiomqtt_client
+    ):
+        """Test a subscription can override the default topic prefix."""
+        client = MQTTClient(mqtt_settings)
+        client.subscribe = AsyncMock()
+
+        event = SampleSubscribeEvent("status", topic_prefix="homeassistant")
+        await client._subscribe_topic(event)
+
+        assert "homeassistant/status" in client._subscribed_topics
+        client.subscribe.assert_called_once_with("homeassistant/status")
 
     @pytest.mark.asyncio
     async def test_subscribe_topic_existing_topic(
         self, mqtt_settings, event_bus, mock_aiomqtt_client
     ):
         """Test subscribing to an already subscribed topic does nothing."""
-        client = MQTTClient(mqtt_settings, event_bus)
+        client = MQTTClient(mqtt_settings)
         client.subscribe = AsyncMock()
-        client._subscribed_topics["test/topic"] = SampleInputEvent
+        client._subscribed_topics["test/test/topic"] = SampleInputEvent
 
         event = SampleSubscribeEvent("test/topic")
         await client._subscribe_topic(event)
@@ -179,7 +219,7 @@ class TestMQTTClientHandleMessage:
         self, mqtt_settings, mock_event_bus, mock_aiomqtt_client
     ):
         """Test handling a valid message with dict payload."""
-        client = MQTTClient(mqtt_settings, mock_event_bus)
+        client = MQTTClient(mqtt_settings)
         client._subscribed_topics["test/topic"] = SampleInputEvent
 
         # Create mock message
@@ -203,7 +243,7 @@ class TestMQTTClientHandleMessage:
         self, mqtt_settings, mock_event_bus, mock_aiomqtt_client
     ):
         """Test handling a valid message with string payload that becomes JSON."""
-        client = MQTTClient(mqtt_settings, mock_event_bus)
+        client = MQTTClient(mqtt_settings)
         client._subscribed_topics["test/topic"] = SampleInputEvent
 
         # The handler tries to parse as JSON then as dict/scalar
@@ -227,7 +267,7 @@ class TestMQTTClientHandleMessage:
         mock_aiomqtt_client,
     ):
         """Test handling Home Assistant online/offline scalar payload."""
-        client = MQTTClient(mqtt_settings, mock_event_bus)
+        client = MQTTClient(mqtt_settings)
         client._subscribed_topics["homeassistant/status"] = HomeAssistantStatusEvent
 
         mock_message = MagicMock()
@@ -248,7 +288,7 @@ class TestMQTTClientHandleMessage:
         self, mqtt_settings, mock_event_bus, mock_aiomqtt_client
     ):
         """Test handling message for unexpected topic."""
-        client = MQTTClient(mqtt_settings, mock_event_bus)
+        client = MQTTClient(mqtt_settings)
 
         mock_message = MagicMock()
         mock_message.topic = MagicMock()
@@ -265,7 +305,7 @@ class TestMQTTClientHandleMessage:
         self, mqtt_settings, mock_event_bus, mock_aiomqtt_client
     ):
         """Test handling message with invalid JSON."""
-        client = MQTTClient(mqtt_settings, mock_event_bus)
+        client = MQTTClient(mqtt_settings)
         client._subscribed_topics["test/topic"] = SampleInputEvent
 
         mock_message = MagicMock()
@@ -279,36 +319,10 @@ class TestMQTTClientHandleMessage:
 
 
 class TestMQTTClientPublish:
-    """Tests for MQTTClient publish methods."""
-
-    @pytest.mark.asyncio
-    async def test_publish_status_online(
-        self, mqtt_settings, event_bus, mock_aiomqtt_client
-    ):
-        """Test publishing online status."""
-        client = MQTTClient(mqtt_settings, event_bus)
-        client.publish_to = AsyncMock()
-
-        await client.publish_status_online()
-
-        client.publish_to.assert_called_once_with("status", "online", True)
-
-    @pytest.mark.asyncio
-    async def test_publish_status_offline(
-        self, mqtt_settings, event_bus, mock_aiomqtt_client
-    ):
-        """Test publishing offline status."""
-        client = MQTTClient(mqtt_settings, event_bus)
-        client.publish_to = AsyncMock()
-
-        await client.publish_status_offline()
-
-        client.publish_to.assert_called_once_with("status", "offline", True)
-
     @pytest.mark.asyncio
     async def test_event_listener(self, mqtt_settings, event_bus, mock_aiomqtt_client):
         """Test event listener calls publish_to."""
-        client = MQTTClient(mqtt_settings, event_bus)
+        client = MQTTClient(mqtt_settings)
         client.publish_to = AsyncMock()
 
         event = MQTTPublishEvent(
@@ -328,6 +342,7 @@ class TestMQTTClientPublish:
             1,
             "custom",
             True,
+            False,
         )
 
     @pytest.mark.asyncio
@@ -335,7 +350,7 @@ class TestMQTTClientPublish:
         self, mqtt_settings, event_bus, mock_aiomqtt_client
     ):
         """Test publish_to with string payload."""
-        client = MQTTClient(mqtt_settings, event_bus)
+        client = MQTTClient(mqtt_settings)
         client._is_connected = True
         client.publish = AsyncMock()
 
@@ -353,7 +368,7 @@ class TestMQTTClientPublish:
         self, mqtt_settings, event_bus, mock_aiomqtt_client
     ):
         """Test publish_to with BaseModel payload."""
-        client = MQTTClient(mqtt_settings, event_bus)
+        client = MQTTClient(mqtt_settings)
         client._is_connected = True
         client.publish = AsyncMock()
 
@@ -372,7 +387,7 @@ class TestMQTTClientPublish:
         self, mqtt_settings, event_bus, mock_aiomqtt_client
     ):
         """Test publish_to with custom topic prefix."""
-        client = MQTTClient(mqtt_settings, event_bus)
+        client = MQTTClient(mqtt_settings)
         client._is_connected = True
         client.publish = AsyncMock()
 
@@ -387,13 +402,32 @@ class TestMQTTClientPublish:
         self, mqtt_settings, event_bus, mock_aiomqtt_client
     ):
         """Test publish_to when not connected does nothing."""
-        client = MQTTClient(mqtt_settings, event_bus)
+        client = MQTTClient(mqtt_settings)
         client._is_connected = False
         client.publish = AsyncMock()
 
         await client.publish_to("topic", "payload", True, topic_prefix="test")
 
         client.publish.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_publish_to_not_connected_with_suppressed_connection_error(
+        self, mqtt_settings, event_bus, mock_aiomqtt_client
+    ):
+        client = MQTTClient(mqtt_settings)
+        client._is_connected = False
+        client.publish = AsyncMock()
+
+        with patch("solaredge2mqtt.core.mqtt.logger.warning") as mock_warning:
+            await client.publish_to(
+                "topic",
+                "payload",
+                True,
+                suppress_connection_error=True,
+            )
+
+        client.publish.assert_not_called()
+        mock_warning.assert_not_called()
 
 
 class TestMQTTClientListen:
@@ -404,7 +438,7 @@ class TestMQTTClientListen:
         self, mqtt_settings, event_bus, mock_aiomqtt_client
     ):
         """Test listen returns immediately with no subscriptions."""
-        client = MQTTClient(mqtt_settings, event_bus)
+        client = MQTTClient(mqtt_settings)
         client._subscribed_topics = {}
 
         # Should return immediately without blocking
@@ -415,7 +449,7 @@ class TestMQTTClientListen:
         self, mqtt_settings, event_bus, mock_aiomqtt_client
     ):
         """Skip messages received on topics that are not subscribed."""
-        client = MQTTClient(mqtt_settings, event_bus)
+        client = MQTTClient(mqtt_settings)
         client._subscribed_topics = {"test/topic": SampleInputEvent}
 
         msg = MagicMock()
@@ -440,7 +474,7 @@ class TestMQTTClientListen:
         self, mqtt_settings, event_bus, mock_aiomqtt_client
     ):
         """Skip messages that exceed maximum payload size."""
-        client = MQTTClient(mqtt_settings, event_bus)
+        client = MQTTClient(mqtt_settings)
         client._subscribed_topics = {"test/topic": SampleInputEvent}
 
         msg = MagicMock()
@@ -465,7 +499,7 @@ class TestMQTTClientListen:
         self, mqtt_settings, event_bus, mock_aiomqtt_client
     ):
         """Drop messages when processing queue is full."""
-        client = MQTTClient(mqtt_settings, event_bus)
+        client = MQTTClient(mqtt_settings)
         client._subscribed_topics = {"test/topic": SampleInputEvent}
         client._received_message_queue = asyncio.Queue(maxsize=1)
 
@@ -499,7 +533,7 @@ class TestMQTTClientProcessQueue:
         self, mqtt_settings, event_bus, mock_aiomqtt_client
     ):
         """Test process_queue returns immediately with no subscriptions."""
-        client = MQTTClient(mqtt_settings, event_bus)
+        client = MQTTClient(mqtt_settings)
         client._subscribed_topics = {}
 
         # Should return immediately without blocking
@@ -510,7 +544,7 @@ class TestMQTTClientProcessQueue:
         self, mqtt_settings, mock_event_bus, mock_aiomqtt_client
     ):
         """Test process_queue handles exceptions in message handling."""
-        client = MQTTClient(mqtt_settings, mock_event_bus)
+        client = MQTTClient(mqtt_settings)
         client._subscribed_topics["test/topic"] = SampleInputEvent
 
         # Add a message to the queue
@@ -543,7 +577,7 @@ class TestMQTTClientHandleMessageErrors:
         self, mqtt_settings, mock_event_bus, mock_aiomqtt_client
     ):
         """Invalid payload type should not emit events."""
-        client = MQTTClient(mqtt_settings, mock_event_bus)
+        client = MQTTClient(mqtt_settings)
         client._subscribed_topics["test/topic"] = SampleInputEvent
 
         mock_message = MagicMock()
@@ -559,7 +593,7 @@ class TestMQTTClientHandleMessageErrors:
         self, mqtt_settings, mock_event_bus, mock_aiomqtt_client
     ):
         """Validation errors are handled without raising."""
-        client = MQTTClient(mqtt_settings, mock_event_bus)
+        client = MQTTClient(mqtt_settings)
         client._subscribed_topics["test/topic"] = SampleInputEvent
 
         mock_message = MagicMock()
@@ -575,7 +609,7 @@ class TestMQTTClientHandleMessageErrors:
         self, mqtt_settings, mock_event_bus, mock_aiomqtt_client
     ):
         """JSON null payload should be rejected as invalid input type."""
-        client = MQTTClient(mqtt_settings, mock_event_bus)
+        client = MQTTClient(mqtt_settings)
         client._subscribed_topics["test/topic"] = SampleInputEvent
 
         mock_message = MagicMock()
@@ -585,3 +619,133 @@ class TestMQTTClientHandleMessageErrors:
         await client._handle_message(mock_message)
 
         mock_event_bus.emit.assert_not_called()
+
+
+class TestMQTTClientLoggingSink:
+    """Tests for MQTTClient logging sink."""
+
+    @pytest.mark.asyncio
+    async def test_logging_sink_formats_and_publishes_message(
+        self, mqtt_settings, event_bus, mock_aiomqtt_client
+    ):
+        """Logging sink should format and publish log messages."""
+        client = MQTTClient(mqtt_settings)
+        client.publish_to = AsyncMock()
+
+        mock_message = MagicMock()
+        mock_message.record = {
+            "time": datetime.fromisoformat("2024-01-15T10:30:45.123456"),
+            "level": SimpleNamespace(name="INFO"),
+            "message": "Test log message",
+        }
+
+        await client.logging_sink(mock_message)
+
+        client.publish_to.assert_called_once_with(
+            "logging",
+            "2024-01-15T10:30:45.123456 | INFO | Test log message",
+            retain=False,
+            suppress_connection_error=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_logging_sink_catches_mqtt_error(
+        self, mqtt_settings, event_bus, mock_aiomqtt_client
+    ):
+        """Logging sink should silently catch MqttError exceptions."""
+        client = MQTTClient(mqtt_settings)
+
+        from aiomqtt import MqttError
+
+        client.publish_to = AsyncMock(side_effect=MqttError("Connection lost"))
+
+        mock_message = MagicMock()
+        mock_message.record = {
+            "time": datetime.fromisoformat("2024-01-15T10:30:45.123456"),
+            "level": SimpleNamespace(name="WARNING"),
+            "message": "Test warning",
+        }
+
+        await client.logging_sink(mock_message)
+
+        client.publish_to.assert_called_once()
+
+    def test_log_filter_filters_core_mqtt_logs(
+        self, mqtt_settings, mock_aiomqtt_client
+    ):
+        """Log filter should exclude logs from MQTTClient."""
+        client = MQTTClient(mqtt_settings)
+
+        record = {"name": "solaredge2mqtt.core.mqtt"}
+        assert client.log_filter(record) is False
+
+    def test_log_filter_filters_core_mqtt_submodules_logs(
+        self, mqtt_settings, mock_aiomqtt_client
+    ):
+        """Log filter should exclude logs from MQTTClient."""
+        client = MQTTClient(mqtt_settings)
+
+        record = {"name": "solaredge2mqtt.core.mqtt.Client"}
+        assert client.log_filter(record) is False
+
+    def test_log_filter_allows_other_logs(self, mqtt_settings, mock_aiomqtt_client):
+        """Log filter should allow logs from other modules."""
+        client = MQTTClient(mqtt_settings)
+
+        record = {"name": "solaredge2mqtt.services.weather.WeatherClient"}
+        assert client.log_filter(record) is True
+
+
+class TestMQTTClientTopicMatching:
+    """Tests for MQTT wildcard topic matching."""
+
+    def test_exact_match(self):
+        assert MQTTClient._topic_matches("a/b/c", "a/b/c") is True
+
+    def test_single_level_wildcard(self):
+        assert MQTTClient._topic_matches("a/+/c", "a/value/c") is True
+
+    def test_single_level_wildcard_no_match_extra_level(self):
+        assert MQTTClient._topic_matches("a/+/c", "a/x/y/c") is False
+
+    def test_single_level_wildcard_requires_level(self):
+        assert MQTTClient._topic_matches("a/+/c", "a/c") is False
+
+    def test_multi_level_wildcard(self):
+        assert MQTTClient._topic_matches("a/#", "a/b/c/d") is True
+
+    def test_no_match_different_segment(self):
+        assert MQTTClient._topic_matches("a/b/c", "a/x/c") is False
+
+    def test_length_mismatch(self):
+        assert MQTTClient._topic_matches("a/b", "a/b/c") is False
+
+    def test_resolve_subscription_exact(self, mqtt_settings, mock_aiomqtt_client):
+        client = MQTTClient(mqtt_settings)
+        client._subscribed_topics["test/api/wallbox/control/charge_level"] = (
+            SampleInputEvent
+        )
+
+        resolved = client._resolve_subscription("test/api/wallbox/control/charge_level")
+
+        assert resolved is SampleInputEvent
+
+    def test_resolve_subscription_wildcard(self, mqtt_settings, mock_aiomqtt_client):
+        client = MQTTClient(mqtt_settings)
+        client._subscribed_topics["test/api/wallbox/+/control/charge_level"] = (
+            SampleInputEvent
+        )
+
+        resolved = client._resolve_subscription(
+            "test/api/wallbox/SE12345/control/charge_level"
+        )
+
+        assert resolved is SampleInputEvent
+
+    def test_resolve_subscription_no_match(self, mqtt_settings, mock_aiomqtt_client):
+        client = MQTTClient(mqtt_settings)
+        client._subscribed_topics["test/api/wallbox/control/charge_level"] = (
+            SampleInputEvent
+        )
+
+        assert client._resolve_subscription("test/other/topic") is None

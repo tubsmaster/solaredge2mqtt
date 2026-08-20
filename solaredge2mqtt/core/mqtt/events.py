@@ -17,6 +17,7 @@ class MQTTPublishEvent(BaseEvent):
         qos: int = 0,
         topic_prefix: str | None = None,
         exclude_none: bool = False,
+        suppress_connection_error: bool = False,
     ):
         self._topic: str = topic
         self._payload: str | int | float | BaseModel = payload
@@ -24,6 +25,7 @@ class MQTTPublishEvent(BaseEvent):
         self._qos: int = qos
         self._topic_prefix: str | None = topic_prefix
         self._exclude_none: bool = exclude_none
+        self._suppress_connection_error: bool = suppress_connection_error
 
     @property
     def topic(self) -> str:
@@ -48,6 +50,10 @@ class MQTTPublishEvent(BaseEvent):
     @property
     def exclude_none(self) -> bool:
         return self._exclude_none
+
+    @property
+    def suppress_connection_error(self) -> bool:
+        return self._suppress_connection_error
 
 
 class MQTTReceivedEvent(Generic[TBaseInputField], BaseEvent):
@@ -109,12 +115,17 @@ class MQTTSubscribeEvent(Generic[TMQTTReceivedEvent], BaseEvent):
             "for MQTTSubscribeEvent[TMQTTReceivedEvent]"
         )
 
-    def __init__(self, topic: str):
+    def __init__(self, topic: str, topic_prefix: str | None = None):
         self._topic: str = topic
+        self._topic_prefix: str | None = topic_prefix
 
     @property
     def topic(self) -> str:
         return self._topic
+
+    @property
+    def topic_prefix(self) -> str | None:
+        return self._topic_prefix
 
     @classmethod
     def event(cls) -> type[TMQTTReceivedEvent]:

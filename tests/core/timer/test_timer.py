@@ -6,6 +6,7 @@ import pytest
 
 from solaredge2mqtt.core.timer import Timer
 from solaredge2mqtt.core.timer.events import (
+    BetweenIntervalTriggerEvent,
     Interval1MinTriggerEvent,
     Interval5MinTriggerEvent,
     Interval10MinTriggerEvent,
@@ -44,18 +45,17 @@ def calculate_timestamp_for_interval(base_interval: int, target_interval: int) -
 class TestTimer:
     """Tests for Timer class."""
 
-    def test_timer_initialization(self, event_bus):
-        """Test Timer initializes with event_bus and base_interval."""
-        timer = Timer(event_bus, 5)
+    def test_timer_initialization(self):
+        """Test Timer initializes with base_interval."""
+        timer = Timer(5)
 
-        assert timer.event_bus is event_bus
         assert timer.base_interval == 5
 
     @pytest.mark.asyncio
     async def test_timer_loop_emits_base_event_on_interval(self, mock_event_bus):
         """Test that timer loop emits base event at correct interval."""
         base_interval = 5
-        timer = Timer(mock_event_bus, base_interval)
+        timer = Timer(base_interval)
 
         with patch("solaredge2mqtt.core.timer.datetime") as mock_datetime:
             # Use a timestamp divisible by base_interval
@@ -74,7 +74,7 @@ class TestTimer:
     async def test_timer_loop_emits_1min_event(self, mock_event_bus):
         """Test that timer loop emits 1 min event at correct interval."""
         base_interval = 5
-        timer = Timer(mock_event_bus, base_interval)
+        timer = Timer(base_interval)
 
         with patch("solaredge2mqtt.core.timer.datetime") as mock_datetime:
             timestamp = calculate_timestamp_for_interval(base_interval, 60)
@@ -92,7 +92,7 @@ class TestTimer:
     async def test_timer_loop_emits_5min_event(self, mock_event_bus):
         """Test that timer loop emits 5 min event at correct interval."""
         base_interval = 5
-        timer = Timer(mock_event_bus, base_interval)
+        timer = Timer(base_interval)
 
         with patch("solaredge2mqtt.core.timer.datetime") as mock_datetime:
             timestamp = calculate_timestamp_for_interval(base_interval, 300)
@@ -110,7 +110,7 @@ class TestTimer:
     async def test_timer_loop_emits_10min_event(self, mock_event_bus):
         """Test that timer loop emits 10 min event at correct interval."""
         base_interval = 5
-        timer = Timer(mock_event_bus, base_interval)
+        timer = Timer(base_interval)
 
         with patch("solaredge2mqtt.core.timer.datetime") as mock_datetime:
             timestamp = calculate_timestamp_for_interval(base_interval, 600)
@@ -128,7 +128,7 @@ class TestTimer:
     async def test_timer_loop_emits_15min_event(self, mock_event_bus):
         """Test that timer loop emits 15 min event at correct interval."""
         base_interval = 5
-        timer = Timer(mock_event_bus, base_interval)
+        timer = Timer(base_interval)
 
         with patch("solaredge2mqtt.core.timer.datetime") as mock_datetime:
             # For base_interval=5, timestamp 919 reaches final 900-divisible check
@@ -146,7 +146,7 @@ class TestTimer:
     async def test_timer_loop_does_not_emit_when_not_on_interval(self, mock_event_bus):
         """Test that timer doesn't emit base event when not on interval."""
         base_interval = 5
-        timer = Timer(mock_event_bus, base_interval)
+        timer = Timer(base_interval)
 
         with patch("solaredge2mqtt.core.timer.datetime") as mock_datetime:
             # Use a timestamp NOT divisible by base_interval
@@ -165,7 +165,7 @@ class TestTimer:
     async def test_timer_with_different_base_intervals(self, mock_event_bus):
         """Test timer works with different base intervals."""
         for interval in [1, 5, 10, 15]:
-            timer = Timer(mock_event_bus, interval)
+            timer = Timer(interval)
 
             with patch("solaredge2mqtt.core.timer.datetime") as mock_datetime:
                 # Use a timestamp that is a multiple of the base interval
@@ -176,3 +176,40 @@ class TestTimer:
                 await timer.loop()
 
                 assert mock_event_bus.emit.called
+
+
+class TestTimerBetweenIntervalTrigger:
+    """Tests for Timer.on_between_interval_trigger handler."""
+
+    @pytest.mark.asyncio
+    async def test_between_interval_trigger_emits_all_long_intervals(
+        self, mock_event_bus
+    ):
+        """
+        Test that BetweenIntervalTriggerEvent causes
+        all long intervals to be emitted.
+        """
+        timer = Timer(5)
+        event = BetweenIntervalTriggerEvent()
+
+        await timer.on_between_interval_trigger(event)
+
+        emitted_types = [
+            type(call.args[0]) for call in mock_event_bus.emit.call_args_list
+        ]
+        assert Interval1MinTriggerEvent in emitted_types
+        assert Interval5MinTriggerEvent in emitted_types
+        assert Interval10MinTriggerEvent in emitted_types
+        assert Interval15MinTriggerEvent in emitted_types
+
+    @pytest.mark.asyncio
+    async def test_between_interval_trigger_emits_exactly_four_events(
+        self, mock_event_bus
+    ):
+        """Test that exactly the four long-interval events are emitted."""
+        timer = Timer(5)
+        event = BetweenIntervalTriggerEvent()
+
+        await timer.on_between_interval_trigger(event)
+
+        assert mock_event_bus.emit.call_count == 4

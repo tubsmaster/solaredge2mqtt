@@ -75,6 +75,11 @@ class ModbusUnitSettings(BaseModel):
         return values
 
 
+class ModbusFollowerSettings(ModbusUnitSettings):
+    host: str | None = Field(default=None)
+    port: int | None = Field(default=None)
+
+
 class ModbusSettings(ModbusUnitSettings):
     host: str
     port: int = Field(default=1502)
@@ -86,9 +91,14 @@ class ModbusSettings(ModbusUnitSettings):
         default=AdvancedControlsSettings.DISABLED
     )
 
-    follower: list[ModbusUnitSettings] = Field(default_factory=list)
+    follower: list[ModbusFollowerSettings] = Field(default_factory=list)
 
     retain: bool = Field(default=False)
+
+    debounce_cycles: int = Field(default=2)
+
+    startup_retry_delay: int = Field(default=30)
+    startup_retry_max_delay: int = Field(default=300)
 
     @model_validator(mode="before")
     @classmethod
@@ -126,3 +136,23 @@ class ModbusSettings(ModbusUnitSettings):
     @property
     def has_followers(self) -> bool:
         return len(self.follower) > 0
+
+    def unit_host(self, unit_key: str) -> str:
+        if unit_key == "leader":
+            return self.host
+
+        unit = self.units.get(unit_key)
+        if unit is None or not isinstance(unit, ModbusFollowerSettings):
+            raise ValueError(f"Unknown modbus unit_key: {unit_key}")
+
+        return unit.host or self.host
+
+    def unit_port(self, unit_key: str) -> int:
+        if unit_key == "leader":
+            return self.port
+
+        unit = self.units.get(unit_key)
+        if unit is None or not isinstance(unit, ModbusFollowerSettings):
+            raise ValueError(f"Unknown modbus unit_key: {unit_key}")
+
+        return unit.port or self.port

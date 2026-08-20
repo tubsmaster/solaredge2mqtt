@@ -38,15 +38,15 @@ error() {
 }
 
 success() {
-    echo -e "${GREEN}✅ $1${NC}"
+    echo -e "${GREEN}✅ $1${NC}" >&2
 }
 
 info() {
-    echo -e "${BLUE}ℹ️  $1${NC}"
+    echo -e "${BLUE}ℹ️  $1${NC}" >&2
 }
 
 warning() {
-    echo -e "${YELLOW}⚠️  $1${NC}"
+    echo -e "${YELLOW}⚠️  $1${NC}" >&2
 }
 
 # ============================================================================
@@ -104,6 +104,7 @@ check_repo_exists() {
     info "Check repo exists"
     [ -z "$PROJECT_ROOT" ] && error "Project root not set"
     [ ! -d "$REPO_DIR" ] && error ".repo directory not found at $REPO_DIR\n\nRun: $SCRIPT_NAME setup <directory>"
+    repair_worktree_backreferences
     return 0
 }
 
@@ -191,13 +192,53 @@ skipping upstream configuration"
 
 convert_git_to_relative() {
     local WORKTREE_PATH=$1
+    local WORKTREE_NAME
+    WORKTREE_NAME=$(basename "$WORKTREE_PATH")
     local GIT_FILE="$WORKTREE_PATH/.git"
-    
+
     [ ! -f "$GIT_FILE" ] && return 0
-    
-    info "Converting .git to relative path..."
-    echo "gitdir: ../.repo/worktrees/$(basename "$WORKTREE_PATH")" > "$GIT_FILE"
-    success "Converted .git to relative path"
+
+    # ── 1. Fix Worktree → Bare Repo (.git file) ──────────────────────────────
+    local EXPECTED_GITDIR="../.repo/worktrees/$WORKTREE_NAME"
+    local CURRENT_GITDIR
+    CURRENT_GITDIR=$(sed 's/gitdir: //' "$GIT_FILE")
+
+    if [ "$CURRENT_GITDIR" != "$EXPECTED_GITDIR" ]; then
+        info "Converting .git to relative path..."
+        echo "gitdir: $EXPECTED_GITDIR" > "$GIT_FILE"
+        success "Converted .git → $EXPECTED_GITDIR"
+    else
+        info ".git already uses relative path"
+    fi
+
+    repair_worktree_backreferences
+}
+
+# git resolves worktrees/<name>/gitdir literally, not relative to its
+# own directory (unlike the forward .git pointer above), so it can
+# never hold a relative path — a relative value makes git report the
+# worktree as prunable. It must always hold the real absolute path
+# for whichever environment (host or container) is currently running
+# git, so self-heal it to the host path on every host-side command.
+# The devcontainer's postStartCommand (.devcontainer/worktree/fix-worktree.sh)
+# does the equivalent repair for the container's absolute path.
+repair_worktree_backreferences() {
+    [ -d "$REPO_DIR/worktrees" ] || return 0
+
+    local WT_DIR NAME GITDIR_FILE EXPECTED CURRENT
+    for WT_DIR in "$REPO_DIR"/worktrees/*/; do
+        [ -d "$WT_DIR" ] || continue
+        NAME=$(basename "$WT_DIR")
+        GITDIR_FILE="$WT_DIR/gitdir"
+        [ -f "$GITDIR_FILE" ] || continue
+
+        EXPECTED="$PROJECT_ROOT/$NAME/.git"
+        CURRENT=$(cat "$GITDIR_FILE")
+
+        if [ "$CURRENT" != "$EXPECTED" ]; then
+            echo "$EXPECTED" > "$GITDIR_FILE"
+        fi
+    done
 }
 
 sanitize_branch_name() {
@@ -276,8 +317,6 @@ create_worktree() {
     
     convert_git_to_relative "$WORKTREE_PATH"
     success "Worktree created at: $WORKTREE_PATH"
-    
-    echo "$WORKTREE_PATH"
 }
 
 # ============================================================================
@@ -513,11 +552,12 @@ cmd_add() {
     local WORKTREE_NAME=$2
     
     [ -z "$BRANCH_NAME" ] && error "Branch name required"
-    
+
     detect_project_root
     check_repo_exists
     configure_bare_repository
-    
+
+    WORKTREE_NAME="${WORKTREE_NAME%/}"
     [ -z "$WORKTREE_NAME" ] && WORKTREE_NAME=$(sanitize_branch_name "$BRANCH_NAME")
     
     local WORKTREE_PATH="$PROJECT_ROOT/$WORKTREE_NAME"
@@ -526,8 +566,8 @@ cmd_add() {
     echo "🚀 Creating worktree: $BRANCH_NAME → $WORKTREE_NAME"
     echo ""
     
-    WORKTREE_PATH=$(create_worktree "$BRANCH_NAME" "$WORKTREE_NAME" "")
-    
+    create_worktree "$BRANCH_NAME" "$WORKTREE_NAME" ""
+
     echo ""
     info "Next: code $WORKTREE_PATH"
 }
@@ -560,16 +600,17 @@ cmd_add_pr() {
     
     echo ""
     # Set upstream to origin/pr/$PR_NUMBER for git pull support
-    WORKTREE_PATH=$(create_worktree "$BRANCH_NAME" "$WORKTREE_NAME" \
-        "origin/pr/$PR_NUMBER")
-    
+    create_worktree "$BRANCH_NAME" "$WORKTREE_NAME" \
+        "origin/pr/$PR_NUMBER"
+
     echo ""
     info "Next: code $WORKTREE_PATH"
 }
 
 cmd_remove() {
     local WORKTREE_NAME=$1
-    
+    WORKTREE_NAME="${WORKTREE_NAME%/}"
+
     [ -z "$WORKTREE_NAME" ] && error "Worktree name required"
     
     detect_project_root

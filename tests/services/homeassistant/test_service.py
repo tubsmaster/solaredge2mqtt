@@ -21,7 +21,10 @@ from solaredge2mqtt.services.homeassistant.service import (
     HomeAssistantDiscovery,
 )
 from solaredge2mqtt.services.modbus.events import ModbusUnitsReadEvent
+from solaredge2mqtt.services.models import Component
+from solaredge2mqtt.services.monitoring.events import EVChargerReadEvent
 from solaredge2mqtt.services.powerflow.events import PowerflowGeneratedEvent
+from solaredge2mqtt.services.wallbox.events import WallboxReadEvent
 
 
 @pytest.fixture
@@ -54,17 +57,39 @@ class TestHomeAssistantDiscoveryInit:
 
     def test_init(self, mock_service_settings, mock_event_bus):
         """Test HomeAssistantDiscovery initialization."""
-        discovery = HomeAssistantDiscovery(mock_service_settings, mock_event_bus)
+        discovery = HomeAssistantDiscovery(mock_service_settings)
 
         assert discovery.settings is mock_service_settings
-        assert discovery.event_bus is mock_event_bus
-        assert discovery._status_topic == "homeassistant/status"
+        mock_event_bus.register.assert_called_once_with(discovery)
 
     def test_subscribes_to_events(self, mock_service_settings, mock_event_bus):
         """Test HomeAssistantDiscovery subscribes to events."""
-        HomeAssistantDiscovery(mock_service_settings, mock_event_bus)
+        HomeAssistantDiscovery(mock_service_settings)
 
-        assert mock_event_bus.subscribe.call_count >= 4
+        mock_event_bus.register.assert_called_once()
+
+
+class TestHomeAssistantDiscoveryEventSubscriptions:
+    """Tests for explicit HomeAssistantDiscovery event subscription contract."""
+
+    def test_subscribed_event_contract(self):
+        """Class listeners must stay bound to the expected event types."""
+        expected_subscriptions = {
+            "component_discovery": {
+                ForecastEvent,
+                EnergyReadEvent,
+                WallboxReadEvent,
+                EVChargerReadEvent,
+            },
+            "units_discovery": {ModbusUnitsReadEvent},
+            "powerflow_discovery": {PowerflowGeneratedEvent},
+            "homeassistant_status": {HomeAssistantStatusEvent},
+        }
+
+        for method_name, expected_events in expected_subscriptions.items():
+            method = getattr(HomeAssistantDiscovery, method_name)
+            subscribed_events = set(getattr(method, "_event_subscriptions", []))
+            assert subscribed_events == expected_events
 
 
 class TestHomeAssistantDiscoveryAsyncInit:
@@ -75,7 +100,7 @@ class TestHomeAssistantDiscoveryAsyncInit:
         self, mock_service_settings, mock_event_bus
     ):
         """Test async_init subscribes to HA status topic."""
-        discovery = HomeAssistantDiscovery(mock_service_settings, mock_event_bus)
+        discovery = HomeAssistantDiscovery(mock_service_settings)
 
         await discovery.async_init()
 
@@ -83,7 +108,10 @@ class TestHomeAssistantDiscoveryAsyncInit:
         call_args = mock_event_bus.emit.call_args
         event = call_args[0][0]
         assert isinstance(event, MQTTSubscribeEvent)
-        assert event.topic == "homeassistant/status"
+        # The MQTT client now centrally prepends the prefix; the status topic
+        # is published on Home Assistant's own prefix, passed as an override.
+        assert event.topic == "status"
+        assert event.topic_prefix == "homeassistant"
 
 
 class TestHomeAssistantDiscoveryStateTopic:
@@ -91,7 +119,7 @@ class TestHomeAssistantDiscoveryStateTopic:
 
     def test_state_topic_without_name(self, mock_service_settings, mock_event_bus):
         """Test state_topic without name."""
-        discovery = HomeAssistantDiscovery(mock_service_settings, mock_event_bus)
+        discovery = HomeAssistantDiscovery(mock_service_settings)
 
         result = discovery.state_topic("powerflow")
 
@@ -99,7 +127,7 @@ class TestHomeAssistantDiscoveryStateTopic:
 
     def test_state_topic_with_name(self, mock_service_settings, mock_event_bus):
         """Test state_topic with name."""
-        discovery = HomeAssistantDiscovery(mock_service_settings, mock_event_bus)
+        discovery = HomeAssistantDiscovery(mock_service_settings)
 
         result = discovery.state_topic("modbus/meter", "meter0")
 
@@ -168,7 +196,7 @@ class TestHomeAssistantDiscoveryComponentDiscovery:
         self, mock_service_settings, mock_event_bus
     ):
         """Test component_discovery with forecast event."""
-        discovery = HomeAssistantDiscovery(mock_service_settings, mock_event_bus)
+        discovery = HomeAssistantDiscovery(mock_service_settings)
         discovery.publish_component = AsyncMock()
 
         mock_component = MagicMock()
@@ -189,7 +217,7 @@ class TestHomeAssistantDiscoveryComponentDiscovery:
         """Test component_discovery with Energy auto_discovery enabled."""
         from solaredge2mqtt.services.energy.models import HistoricEnergy
 
-        discovery = HomeAssistantDiscovery(mock_service_settings, mock_event_bus)
+        discovery = HomeAssistantDiscovery(mock_service_settings)
         discovery.publish_component = AsyncMock()
 
         # Create mock component with period info
@@ -214,7 +242,7 @@ class TestHomeAssistantDiscoveryComponentDiscovery:
         """Test component_discovery with EnergyReadEvent already seen."""
         from solaredge2mqtt.services.energy.models import HistoricEnergy
 
-        discovery = HomeAssistantDiscovery(mock_service_settings, mock_event_bus)
+        discovery = HomeAssistantDiscovery(mock_service_settings)
         discovery.publish_component = AsyncMock()
 
         # Create mock component with period info
@@ -226,7 +254,7 @@ class TestHomeAssistantDiscoveryComponentDiscovery:
         mock_component.info.period.auto_discovery = True
 
         # Mark as already seen
-        discovery._seen_energy_periods.add("energy/today")
+        discovery._seen_component_topics.add("energy/today")
 
         event = EnergyReadEvent(mock_component)
 
@@ -242,7 +270,7 @@ class TestHomeAssistantDiscoveryComponentDiscovery:
         """Test component_discovery with Energy auto_discovery disabled."""
         from solaredge2mqtt.services.energy.models import HistoricEnergy
 
-        discovery = HomeAssistantDiscovery(mock_service_settings, mock_event_bus)
+        discovery = HomeAssistantDiscovery(mock_service_settings)
         discovery.publish_component = AsyncMock()
 
         # Create mock component with period info
@@ -267,7 +295,7 @@ class TestHomeAssistantDiscoveryUnitsDiscovery:
     @pytest.mark.asyncio
     async def test_units_discovery(self, mock_service_settings, mock_event_bus):
         """Test units_discovery with modbus units."""
-        discovery = HomeAssistantDiscovery(mock_service_settings, mock_event_bus)
+        discovery = HomeAssistantDiscovery(mock_service_settings)
         discovery.publish_component = AsyncMock()
 
         # Create mock inverter
@@ -300,7 +328,7 @@ class TestHomeAssistantDiscoveryPowerflowDiscovery:
     @pytest.mark.asyncio
     async def test_powerflow_discovery(self, mock_service_settings, mock_event_bus):
         """Test powerflow_discovery."""
-        discovery = HomeAssistantDiscovery(mock_service_settings, mock_event_bus)
+        discovery = HomeAssistantDiscovery(mock_service_settings)
         discovery.publish_component = AsyncMock()
 
         mock_powerflow = MagicMock()
@@ -322,7 +350,7 @@ class TestHomeAssistantDiscoveryStatus:
         self, mock_service_settings, mock_event_bus
     ):
         """Test handling HA status online event."""
-        discovery = HomeAssistantDiscovery(mock_service_settings, mock_event_bus)
+        discovery = HomeAssistantDiscovery(mock_service_settings)
 
         # Add some cached entities
         mock_entity = MagicMock()
@@ -344,7 +372,7 @@ class TestHomeAssistantDiscoveryStatus:
         self, mock_service_settings, mock_event_bus
     ):
         """Test ignoring status events from wrong topic."""
-        discovery = HomeAssistantDiscovery(mock_service_settings, mock_event_bus)
+        discovery = HomeAssistantDiscovery(mock_service_settings)
 
         mock_input = MagicMock(spec=HomeAssistantStatusInput)
         mock_input.status = HomeAssistantStatus.ONLINE
@@ -361,10 +389,10 @@ class TestHomeAssistantDiscoveryStatus:
         self, mock_service_settings, mock_event_bus
     ):
         """Test no resend when HA status is not ONLINE on status topic."""
-        discovery = HomeAssistantDiscovery(mock_service_settings, mock_event_bus)
+        discovery = HomeAssistantDiscovery(mock_service_settings)
 
         mock_input = MagicMock(spec=HomeAssistantStatusInput)
-        mock_input.status = None
+        mock_input.status = HomeAssistantStatus.OFFLINE
 
         event = HomeAssistantStatusEvent("homeassistant/status", mock_input)
 
@@ -381,7 +409,7 @@ class TestHomeAssistantDiscoveryPublishComponent:
         """Test publish_component creates and publishes entities."""
         from solaredge2mqtt.services.powerflow.models import Powerflow
 
-        discovery = HomeAssistantDiscovery(mock_service_settings, mock_event_bus)
+        discovery = HomeAssistantDiscovery(mock_service_settings)
 
         # Create mock component
         mock_component = MagicMock(spec=Powerflow)
@@ -403,6 +431,32 @@ class TestHomeAssistantDiscoveryPublishComponent:
         # Should emit publish events
         assert mock_event_bus.emit.call_count > 0
 
+    def test_availability_topic_with_component_with_service(
+        self, mock_service_settings
+    ):
+        """Test availability_topic for component with availability service."""
+        discovery = HomeAssistantDiscovery(mock_service_settings)
+
+        component = MagicMock(spec=Component)
+        component.AVAILABILITY_SERVICE = "test"
+
+        topic = discovery.availability_topic(component)
+
+        assert topic == "solaredge/status/test"
+
+    def test_availability_topic_with_component_without_service(
+        self, mock_service_settings
+    ):
+        """Test availability_topic for component without availability service."""
+        discovery = HomeAssistantDiscovery(mock_service_settings)
+
+        component = MagicMock(spec=Component)
+        component.AVAILABILITY_SERVICE = None
+
+        topic = discovery.availability_topic(component)
+
+        assert topic == "solaredge/status"
+
     @pytest.mark.asyncio
     async def test_publish_component_with_modbus_inverter(
         self, mock_service_settings, mock_event_bus
@@ -415,7 +469,7 @@ class TestHomeAssistantDiscoveryPublishComponent:
         # Disable grid status check to test filtering
         mock_service_settings.modbus.check_grid_status = False
 
-        discovery = HomeAssistantDiscovery(mock_service_settings, mock_event_bus)
+        discovery = HomeAssistantDiscovery(mock_service_settings)
 
         # Create mock inverter
         mock_inverter = MagicMock(spec=ModbusInverter)
@@ -456,7 +510,7 @@ class TestHomeAssistantDiscoveryPublishComponent:
         # Disable advanced power controls
         mock_service_settings.modbus.advanced_power_controls_enabled = False
 
-        discovery = HomeAssistantDiscovery(mock_service_settings, mock_event_bus)
+        discovery = HomeAssistantDiscovery(mock_service_settings)
 
         mock_inverter = MagicMock(spec=ModbusInverter)
         mock_inverter.mqtt_topic.return_value = "modbus/inverter"
@@ -492,7 +546,7 @@ class TestHomeAssistantDiscoveryPublishComponent:
         mock_service_settings.is_prices_configured = True
         mock_service_settings.prices.currency = "USD"
 
-        discovery = HomeAssistantDiscovery(mock_service_settings, mock_event_bus)
+        discovery = HomeAssistantDiscovery(mock_service_settings)
 
         mock_component = MagicMock()
         mock_component.mqtt_topic.return_value = "energy"

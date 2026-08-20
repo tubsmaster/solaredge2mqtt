@@ -9,7 +9,11 @@ from solaredge2mqtt.core.events import EventBus
 from solaredge2mqtt.core.exceptions import ConfigurationException, InvalidDataException
 from solaredge2mqtt.core.logging import logger
 from solaredge2mqtt.services.http_async import HTTPClientAsync
-from solaredge2mqtt.services.wallbox.events import WallboxReadEvent
+from solaredge2mqtt.services.wallbox.events import (
+    WallboxOfflineEvent,
+    WallboxOnlineEvent,
+    WallboxReadEvent,
+)
 from solaredge2mqtt.services.wallbox.models import WallboxAPI
 from solaredge2mqtt.services.wallbox.settings import WallboxSettings
 
@@ -51,10 +55,9 @@ class AuthorizationTokens(BaseModel):
 
 
 class WallboxClient(HTTPClientAsync):
-    def __init__(self, settings: WallboxSettings, event_bus: EventBus):
+    def __init__(self, settings: WallboxSettings):
         super().__init__("Wallbox API")
         self.settings = settings
-        self.event_bus = event_bus
         self.authorization: AuthorizationTokens | None = None
 
         logger.info(
@@ -88,11 +91,21 @@ class WallboxClient(HTTPClientAsync):
                 wallbox=wallbox,
             )
 
-            await self.event_bus.emit(WallboxReadEvent(wallbox))
+            await EventBus.emit(WallboxReadEvent(wallbox))
+
+            await EventBus.emit(WallboxOnlineEvent(self.settings.debounce_cycles))
 
             return wallbox
         except (ClientResponseError, asyncio.TimeoutError) as error:
+            await EventBus.emit(WallboxOfflineEvent())
             raise InvalidDataException(f"Cannot read Wallbox data: {error}") from error
+        except (ConfigurationException, InvalidDataException):
+            await EventBus.emit(WallboxOfflineEvent())
+            raise
+
+    async def close(self) -> None:
+        await EventBus.emit(WallboxOfflineEvent())
+        await super().close()
 
     async def _get_access(self) -> None:
         current_timestamp = int(time.time())
@@ -109,7 +122,7 @@ class WallboxClient(HTTPClientAsync):
 
     async def login(self):
         try:
-            logger.info("Logging in to Wallbox charger...")
+            logger.info("Logging in to Wallbox...")
             self.authorization = None
             async with asyncio.timeout(5):
                 response = await self._post(
@@ -126,10 +139,10 @@ class WallboxClient(HTTPClientAsync):
 
             self.authorization = AuthorizationTokens.model_validate(response)
 
-            logger.info("Logged in to EV charger")
+            logger.info("Logged in to Wallbox")
         except (ClientResponseError, asyncio.TimeoutError) as error:
             raise ConfigurationException(
-                "wallbox", "Unable to login to EV charger"
+                "wallbox", "Unable to login to Wallbox"
             ) from error
 
     async def _refresh_token(self):

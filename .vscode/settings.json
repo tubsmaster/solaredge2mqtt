@@ -16,10 +16,6 @@
     "git.alwaysSignOff": true,
     "python.analysis.autoImportCompletions": true,
     "python.terminal.useEnvFile": true,
-    "sonarlint.connectedMode.project": {
-        "connectionId": "deroetzi",
-        "projectKey": "DerOetzi_solaredge2mqtt"
-    },
     "python.testing.pytestArgs": [
         "tests"
     ],
@@ -30,4 +26,9 @@
         "editor.defaultFormatter": "vscode.json-language-features"
     },
     "editor.formatOnSave": true,
+    "[python]": {
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.formatOnSave": true
+    },
+    "ruff.organizeImports": true
 }

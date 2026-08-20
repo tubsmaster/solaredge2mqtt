@@ -8,6 +8,7 @@ from aiohttp import ClientResponseError, RequestInfo
 
 from solaredge2mqtt.core.exceptions import ConfigurationException, InvalidDataException
 from solaredge2mqtt.core.mqtt.events import MQTTPublishEvent
+from solaredge2mqtt.core.timer.events import Interval10MinTriggerEvent
 from solaredge2mqtt.services.weather import WeatherClient
 from solaredge2mqtt.services.weather.events import WeatherUpdateEvent
 
@@ -25,6 +26,7 @@ def mock_service_settings():
     settings.weather.api_key.get_secret_value.return_value = "test_api_key"
     settings.weather.language = "en"
     settings.weather.retain = False
+    settings.weather.debounce_cycles = 0
 
     return settings
 
@@ -69,19 +71,19 @@ class TestWeatherClientInit:
 
     def test_weather_client_init(self, mock_service_settings, mock_event_bus):
         """Test WeatherClient initialization."""
-        client = WeatherClient(mock_service_settings, mock_event_bus)
+        client = WeatherClient(mock_service_settings)
 
         assert client.location is mock_service_settings.location
         assert client.settings is mock_service_settings.weather
-        assert client.event_bus is mock_event_bus
+        mock_event_bus.register.assert_called_once_with(client)
 
     def test_weather_client_subscribes_to_events(
         self, mock_service_settings, mock_event_bus
     ):
         """Test WeatherClient subscribes to 10min interval event."""
-        WeatherClient(mock_service_settings, mock_event_bus)
+        WeatherClient(mock_service_settings)
 
-        mock_event_bus.subscribe.assert_called()
+        mock_event_bus.register.assert_called_once()
 
 
 class TestWeatherClientGetWeather:
@@ -92,7 +94,7 @@ class TestWeatherClientGetWeather:
         self, mock_service_settings, mock_event_bus, mock_weather_response
     ):
         """Test successful weather retrieval."""
-        client = WeatherClient(mock_service_settings, mock_event_bus)
+        client = WeatherClient(mock_service_settings)
         client._get = AsyncMock(return_value=mock_weather_response)
 
         result = await client.get_weather()
@@ -106,7 +108,7 @@ class TestWeatherClientGetWeather:
         self, mock_service_settings, mock_event_bus
     ):
         """Test get_weather raises when response is None."""
-        client = WeatherClient(mock_service_settings, mock_event_bus)
+        client = WeatherClient(mock_service_settings)
         client._get = AsyncMock(return_value=None)
 
         with pytest.raises(InvalidDataException) as exc_info:
@@ -117,7 +119,7 @@ class TestWeatherClientGetWeather:
     @pytest.mark.asyncio
     async def test_get_weather_401_error(self, mock_service_settings, mock_event_bus):
         """Test get_weather handles 401 error."""
-        client = WeatherClient(mock_service_settings, mock_event_bus)
+        client = WeatherClient(mock_service_settings)
 
         mock_request_info = MagicMock(spec=RequestInfo)
         mock_request_info.real_url = "https://test.com"
@@ -139,7 +141,7 @@ class TestWeatherClientGetWeather:
         self, mock_service_settings, mock_event_bus
     ):
         """Test get_weather handles other HTTP errors."""
-        client = WeatherClient(mock_service_settings, mock_event_bus)
+        client = WeatherClient(mock_service_settings)
 
         mock_request_info = MagicMock(spec=RequestInfo)
         mock_request_info.real_url = "https://test.com"
@@ -159,7 +161,7 @@ class TestWeatherClientGetWeather:
     @pytest.mark.asyncio
     async def test_get_weather_timeout(self, mock_service_settings, mock_event_bus):
         """Test get_weather handles timeout."""
-        client = WeatherClient(mock_service_settings, mock_event_bus)
+        client = WeatherClient(mock_service_settings)
         client._get = AsyncMock(side_effect=asyncio.TimeoutError())
 
         with pytest.raises(InvalidDataException) as exc_info:
@@ -173,8 +175,9 @@ class TestWeatherClientGetWeather:
         mock_settings = MagicMock()
         mock_settings.location = None
         mock_settings.weather = MagicMock()
+        mock_settings.weather.debounce_cycles = 0
 
-        client = WeatherClient(mock_settings, mock_event_bus)
+        client = WeatherClient(mock_settings)
 
         with pytest.raises(ConfigurationException) as exc_info:
             await client.get_weather()
@@ -190,19 +193,42 @@ class TestWeatherClientLoop:
         self, mock_service_settings, mock_event_bus, mock_weather_response
     ):
         """Test loop publishes weather data."""
-        client = WeatherClient(mock_service_settings, mock_event_bus)
+        from solaredge2mqtt.services.weather.events import WeatherOnlineEvent
+
+        client = WeatherClient(mock_service_settings)
         client._get = AsyncMock(return_value=mock_weather_response)
 
-        await client.loop(None)
+        await client.loop(Interval10MinTriggerEvent())
 
-        # Should emit WeatherUpdateEvent and MQTTPublishEvent
-        assert mock_event_bus.emit.call_count == 2
+        # Should emit service state, WeatherUpdateEvent and weather MQTT event
+        assert mock_event_bus.emit.call_count == 3
 
-        # Check first call is WeatherUpdateEvent
+        # Check first call is WeatherOnlineEvent
         first_call = mock_event_bus.emit.call_args_list[0]
-        assert isinstance(first_call[0][0], WeatherUpdateEvent)
+        assert isinstance(first_call[0][0], WeatherOnlineEvent)
 
-        # Check second call is MQTTPublishEvent
+        # Check second call is WeatherUpdateEvent
         second_call = mock_event_bus.emit.call_args_list[1]
-        assert isinstance(second_call[0][0], MQTTPublishEvent)
-        assert second_call[0][0].topic == "weather/current"
+        assert isinstance(second_call[0][0], WeatherUpdateEvent)
+
+        # Check third call is MQTTPublishEvent
+        third_call = mock_event_bus.emit.call_args_list[2]
+        assert isinstance(third_call[0][0], MQTTPublishEvent)
+        assert third_call[0][0].topic == "weather/current"
+
+    @pytest.mark.asyncio
+    async def test_loop_sets_offline_state_on_weather_error(
+        self, mock_service_settings, mock_event_bus
+    ):
+        """Loop should emit offline event on known errors."""
+        from solaredge2mqtt.services.weather.events import WeatherOfflineEvent
+
+        client = WeatherClient(mock_service_settings)
+        client.get_weather = AsyncMock(side_effect=InvalidDataException("boom"))
+
+        with pytest.raises(InvalidDataException):
+            await client.loop(Interval10MinTriggerEvent())
+
+        # Check that WeatherOfflineEvent was emitted
+        emit_calls = mock_event_bus.emit.call_args_list
+        assert any(isinstance(call[0][0], WeatherOfflineEvent) for call in emit_calls)

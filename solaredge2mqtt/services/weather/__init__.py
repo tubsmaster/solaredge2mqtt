@@ -11,7 +11,11 @@ from solaredge2mqtt.core.logging import logger
 from solaredge2mqtt.core.mqtt.events import MQTTPublishEvent
 from solaredge2mqtt.core.timer.events import Interval10MinTriggerEvent
 from solaredge2mqtt.services.http_async import HTTPClientAsync
-from solaredge2mqtt.services.weather.events import WeatherUpdateEvent
+from solaredge2mqtt.services.weather.events import (
+    WeatherOfflineEvent,
+    WeatherOnlineEvent,
+    WeatherUpdateEvent,
+)
 from solaredge2mqtt.services.weather.models import OpenWeatherMapOneCall
 
 if TYPE_CHECKING:
@@ -22,28 +26,30 @@ TIMEMACHINE_URL = "https://api.openweathermap.org/data/3.0/onecall/timemachine"
 
 
 class WeatherClient(HTTPClientAsync):
-    def __init__(self, settings: ServiceSettings, event_bus: EventBus) -> None:
+    def __init__(self, settings: ServiceSettings) -> None:
         super().__init__("Weather API")
 
         self.location = settings.location
         self.settings = settings.weather
 
-        self.event_bus = event_bus
-        self._subscribe_events()
+        EventBus.register(self)
 
-    def _subscribe_events(self):
-        self.event_bus.subscribe(Interval10MinTriggerEvent, self.loop)
-
+    @EventBus.subscribe(Interval10MinTriggerEvent)
     async def loop(self, event: Interval10MinTriggerEvent | None) -> None:
-        weather = await self.get_weather()
-        await self.event_bus.emit(WeatherUpdateEvent(weather))
-        await self.event_bus.emit(
-            MQTTPublishEvent(
-                "weather/current",
-                weather.current,
-                self.settings is not None and self.settings.retain,
+        try:
+            weather = await self.get_weather()
+            await EventBus.emit(WeatherOnlineEvent(self.settings.debounce_cycles))
+            await EventBus.emit(WeatherUpdateEvent(weather))
+            await EventBus.emit(
+                MQTTPublishEvent(
+                    "weather/current",
+                    weather.current,
+                    self.settings is not None and self.settings.retain,
+                )
             )
-        )
+        except (ConfigurationException, InvalidDataException):
+            await EventBus.emit(WeatherOfflineEvent())
+            raise
 
     async def get_weather(self) -> OpenWeatherMapOneCall:
         if self.location is None or self.settings is None:

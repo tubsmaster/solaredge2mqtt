@@ -31,10 +31,11 @@ jobs:
         id: var
         with:
           script: |
-            core.setOutput('ref_name', '${{ github.ref_name }}'.toLowerCase().replaceAll(/[/.]/g, '-').trim('-'));
+            const refName = '${{ github.ref_name || github.event.release.tag_name }}';
+            core.setOutput('ref_name', refName.toLowerCase().replaceAll(/[/.]/g, '-').trim('-'));
             core.setOutput('image_name', '${{ github.repository }}'.toLowerCase());
             core.setOutput('ghcr_image', '${{ env.REGISTRY_GITHUB }}/${{ github.repository }}'.toLowerCase());
-            const version = '${{ github.ref_name }}'.replace(/^v/, '');
+            const version = refName.replace(/^v/, '');
             core.setOutput('version', version);
 
   build-check:
@@ -47,23 +48,17 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
 
       - name: Set up Python 3.13
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.13"
 
-      - name: Set up Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
-        with:
-          node-version: "24"
-          cache: "npm"
-
       - name: Cache Python packages
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
             ~/.cache/pip
@@ -82,9 +77,6 @@ jobs:
 
       - name: Install package with dev dependencies
         run: pip install -e ".[dev,forecast]"
-
-      - name: Install Node dependencies
-        run: npm ci --ignore-scripts
 
       - name: Get changed Python files
         id: changed-py-files
@@ -106,28 +98,13 @@ jobs:
         run: |
           FILES="${{ steps.changed-py-files.outputs.files }}"
           if [ -z "$FILES" ]; then
-            npx pyright
+            pyright
           else
-            npx pyright $FILES
+            pyright $FILES
           fi
 
       - name: Run tests with coverage
         run: python -m pytest --cov=solaredge2mqtt --cov-report=xml:coverage.xml --tb=short
-
-      - name: SonarCloud Scan skipped (external fork PR)
-        if: >-
-          ${{ github.event_name == 'pull_request' &&
-              github.event.pull_request.head.repo.full_name != github.repository }}
-        run: |
-          echo "::notice::SonarCloud Scan skipped: pull request originates from an external fork. SONAR_TOKEN is not available for fork PRs (GitHub security policy). Sonar analysis will run after the PR is merged to main or on internal branches."
-
-      - name: SonarCloud Scan
-        if: >-
-          ${{ github.event_name != 'pull_request' ||
-              github.event.pull_request.head.repo.full_name == github.repository }}
-        uses: SonarSource/sonarqube-scan-action@59db25f34e16620e48ab4bb9e4a5dce155cb5432
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
       - name: Build package
         run: python -m build
@@ -141,7 +118,7 @@ jobs:
 
       - name: Publish package to pypi
         if: ${{ github.event_name == 'release' }}
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247
         with:
           packages-dir: dist/
 
@@ -151,7 +128,7 @@ jobs:
         with:
           repo_token: ${{ github.token }}
           file: dist/*
-          tag: ${{ github.ref }}
+          tag: ${{ github.event.release.tag_name }}
           overwrite: true
           file_glob: true
 
@@ -169,17 +146,17 @@ jobs:
           - "3.12"
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Cache Python packages
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
             ~/.cache/pip
@@ -215,7 +192,7 @@ jobs:
         arch: [amd64, arm64, arm/v7]
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
 
@@ -229,17 +206,17 @@ jobs:
         run: python generate_requirements.py
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8
         with:
           platforms: linux/amd64,linux/arm64,linux/arm/v7
 
       - name: Set up Docker Buildx
         id: buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c
 
       - name: Log in to the Docker github container registry
         if: ${{github.event_name == 'release' || (github.event_name == 'push' && contains(fromJSON(vars.PACKAGE_BRANCHES), github.ref_name))}}
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121
+        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c
         with:
           registry: ${{ env.REGISTRY_GITHUB }}
           username: ${{ github.actor }}
@@ -247,7 +224,7 @@ jobs:
 
       - name: Log in to the Docker container registry
         if: ${{github.event_name == 'release'}}
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121
+        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -263,7 +240,7 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302
         with:
           images: |
             ${{ env.GHCR_IMAGE }}
@@ -274,7 +251,7 @@ jobs:
             type=raw,value=${{ env.REF_NAME }}-${{ env.ARCH_TAG }},enable=${{ github.event_name != 'release' }}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
         with:
           builder: ${{ steps.buildx.outputs.name }}
           context: .
@@ -300,10 +277,10 @@ jobs:
       packages: write
     steps:
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c
 
       - name: Log in to the Docker github container registry
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121
+        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c
         with:
           registry: ${{ env.REGISTRY_GITHUB }}
           username: ${{ github.actor }}
@@ -311,14 +288,14 @@ jobs:
 
       - name: Log in to the Docker container registry
         if: ${{github.event_name == 'release'}}
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121
+        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302
         with:
           images: |
             ${{ env.GHCR_IMAGE }}
