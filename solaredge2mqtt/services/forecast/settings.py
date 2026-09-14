@@ -28,9 +28,14 @@ def _get_default_cache_dir() -> str:
 class ForecastSettings(BaseModel):
     enable: bool = Field(default=False)
     hyperparametertuning: bool = Field(default=False)
+    training_interval_hours: int = Field(default=0, ge=0)
+    hyperparametertuning_interval_days: int = Field(default=7, ge=0)
     cachingdir: str | None = Field(default_factory=_get_default_cache_dir)
     cache_size_limit_mb: int = Field(default=512, ge=1)
     retain: bool = Field(default=False)
+    battery_target_soc: float = Field(default=98.0, ge=0, le=100)
+    battery_charge_efficiency: float = Field(default=0.92, gt=0, le=1)
+    production_threshold_wh: float = Field(default=500.0, ge=0)
 
     @property
     def is_configured(self) -> bool:

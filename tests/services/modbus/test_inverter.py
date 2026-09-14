@@ -9,7 +9,7 @@ from solaredge2mqtt.services.modbus.models.base import (
 )
 from solaredge2mqtt.services.modbus.models.inverter import (
     ModbusInverter,
-    ModbusPowerControl,
+    ModbusStorEdgeControl,
 )
 from solaredge2mqtt.services.modbus.sunspec.values import SunSpecPayload
 
@@ -31,11 +31,26 @@ def make_device_info(with_unit: bool = False) -> ModbusDeviceInfo:
     )
 
 
+def make_storedge_control_data() -> dict:
+    """Create StorEdge control register payload for testing."""
+    return {
+        "storage_control_mode": 4,
+        "storage_ac_charge_policy": 1,
+        "storage_ac_charge_limit": 5000.0,
+        "storage_backup_reserved_setting": 10.0,
+        "storage_default_mode": 6,
+        "remote_control_command_timeout": 3600,
+        "remote_control_command_mode": 0,
+        "remote_control_charge_limit": 5000.0,
+        "remote_control_discharge_limit": 5000.0,
+    }
+
+
 def make_inverter_data(
     status: int = 4,
     with_grid_status: bool = False,
     grid_status: int = 0,
-    with_advanced_power: bool = False,
+    with_storedge_control: bool = False,
 ) -> dict:
     """Create inverter data for testing."""
     data = {
@@ -73,9 +88,8 @@ def make_inverter_data(
     if with_grid_status:
         data["grid_status"] = grid_status
 
-    if with_advanced_power:
-        data["advanced_power_control_enable"] = True
-        data["active_power_limit"] = 100
+    if with_storedge_control:
+        data.update(make_storedge_control_data())
 
     return data
 
@@ -170,26 +184,6 @@ class TestModbusInverter:
         # grid_status 1 represents grid OFF state (inverted boolean)
         assert inverter.grid_status is False
 
-    def test_inverter_without_advanced_power_controls(self):
-        """Test inverter without advanced power controls."""
-        info = make_device_info()
-        data = make_inverter_data(with_advanced_power=False)
-
-        inverter = ModbusInverter.from_sunspec(info, data)
-
-        assert inverter.advanced_power_controls is None
-
-    def test_inverter_with_advanced_power_controls(self):
-        """Test inverter with advanced power controls."""
-        info = make_device_info()
-        data = make_inverter_data(with_advanced_power=True)
-
-        inverter = ModbusInverter.from_sunspec(info, data)
-
-        assert inverter.advanced_power_controls is not None
-        assert inverter.advanced_power_controls.advanced_power_control is True
-        assert inverter.advanced_power_controls.active_power_limit == 100
-
     def test_inverter_homeassistant_device_info(self):
         """Test inverter homeassistant_device_info method."""
         info = make_device_info()
@@ -221,30 +215,94 @@ class TestModbusInverter:
             inverter = ModbusInverter.from_sunspec(info, data)
             assert inverter.status_text == expected_text
 
+    def test_inverter_without_storedge_control(self):
+        """Test inverter without StorEdge control data."""
+        info = make_device_info()
+        data = make_inverter_data(with_storedge_control=False)
 
-class TestModbusPowerControl:
-    """Tests for ModbusPowerControl class."""
+        inverter = ModbusInverter.from_sunspec(info, data)
 
-    def test_power_control_creation(self):
-        """Test ModbusPowerControl creation."""
-        data = {
-            "advanced_power_control_enable": True,
-            "active_power_limit": 80,
+        assert inverter.storedge_control is None
+
+    def test_inverter_with_storedge_control(self):
+        """Test inverter attaches StorEdge control data when present."""
+        info = make_device_info()
+        data = make_inverter_data(with_storedge_control=True)
+
+        inverter = ModbusInverter.from_sunspec(info, data)
+
+        assert inverter.storedge_control is not None
+        assert inverter.storedge_control.storage_control_mode == 4
+        assert inverter.storedge_control.storage_default_mode == 6
+
+
+class TestModbusStorEdgeControl:
+    """Tests for ModbusStorEdgeControl class."""
+
+    def test_storedge_control_creation(self):
+        """Test ModbusStorEdgeControl creation from a full StorEdge payload."""
+        data = make_storedge_control_data()
+
+        control = ModbusStorEdgeControl.from_sunspec(data)
+
+        assert control.storage_control_mode == 4
+        assert control.storage_ac_charge_policy == 1
+        assert control.storage_ac_charge_limit == pytest.approx(5000.0)
+        assert control.storage_backup_reserved_setting == pytest.approx(10.0)
+        assert control.storage_default_mode == 6
+        assert control.remote_control_command_timeout == 3600
+        assert control.remote_control_command_mode == 0
+        assert control.remote_control_charge_limit == pytest.approx(5000.0)
+        assert control.remote_control_discharge_limit == pytest.approx(5000.0)
+
+    def test_storedge_control_fields_carry_ha_command_topics(self):
+        """Test each field exposes the short write-topic suffix from Phase 2."""
+        from solaredge2mqtt.services.homeassistant.service import (
+            HomeAssistantDiscovery,
+        )
+
+        entities = ModbusStorEdgeControl.parse_schema(
+            HomeAssistantDiscovery.property_parser
+        )
+        command_topics = {
+            entity["path"][0]: entity["command_topic_override"] for entity in entities
         }
 
-        power_control = ModbusPowerControl.from_sunspec(data)
-
-        assert power_control.advanced_power_control is True
-        assert power_control.active_power_limit == 80
-
-    def test_power_control_disabled(self):
-        """Test ModbusPowerControl when disabled."""
-        data = {
-            "advanced_power_control_enable": False,
-            "active_power_limit": 100,
+        assert command_topics == {
+            "storage_control_mode": "storedge/control_mode",
+            "storage_ac_charge_policy": "storedge/ac_charge_policy",
+            "storage_ac_charge_limit": "storedge/ac_charge_limit",
+            "storage_backup_reserved_setting": "storedge/backup_reserved_setting",
+            "storage_default_mode": "storedge/default_mode",
+            "remote_control_command_timeout": "storedge/command_timeout",
+            "remote_control_command_mode": "storedge/command_mode",
+            "remote_control_charge_limit": "storedge/charge_limit",
+            "remote_control_discharge_limit": "storedge/discharge_limit",
         }
 
-        power_control = ModbusPowerControl.from_sunspec(data)
+    def test_inverter_parse_schema_includes_storedge_control_fields(self):
+        """Regression: ModbusInverter.parse_schema() must walk the Optional
+        storedge_control field without raising. storedge_control is declared
+        as `ModbusStorEdgeControl | None`, so its schema entry is wrapped in
+        an "anyOf" with no top-level "title" key (its own title is set to ""
+        to suppress the "StorEdge Control" name prefix) — a blank string
+        parent title crashed _walk_schema with KeyError('title') before,
+        because it only checked `"title" in prop` indirectly via truthiness
+        of a plain dict access rather than presence. Calling parse_schema on
+        the outer ModbusInverter (not ModbusStorEdgeControl directly)
+        exercises that Optional-wrapping path, unlike the sibling test
+        above.
+        """
+        from solaredge2mqtt.services.homeassistant.service import (
+            HomeAssistantDiscovery,
+        )
 
-        assert power_control.advanced_power_control is False
-        assert power_control.active_power_limit == 100
+        entities = ModbusInverter.parse_schema(HomeAssistantDiscovery.property_parser)
+        names = {
+            entity["path"][-1]: entity["name"]
+            for entity in entities
+            if entity["path"] and entity["path"][0] == "storedge_control"
+        }
+
+        assert names["storage_control_mode"] == "Storage control mode"
+        assert names["storage_ac_charge_policy"] == "AC charge policy"

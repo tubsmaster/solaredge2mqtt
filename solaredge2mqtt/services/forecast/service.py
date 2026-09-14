@@ -1,40 +1,36 @@
 from __future__ import annotations
 
-import time
-from asyncio import Event, to_thread
+from asyncio import to_thread
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
-from joblib import Memory
-from numpy import percentile
-from numpy.typing import NDArray
-from pandas import DataFrame, Series, to_datetime
-from sklearn import clone
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.inspection import permutation_importance
-from sklearn.model_selection import GridSearchCV, TimeSeriesSplit, train_test_split
-from sklearn.pipeline import Pipeline
+from pandas import DataFrame, to_datetime
+from pvlearn.config import ForecasterConfig
+from pvlearn.exceptions import ModelNotTrainedError, PVLearnError, SchemaMismatchError
+from pvlearn.forecaster import Forecaster
+from pvlearn.location import Location
+from pvlearn.schema import (
+    CATEGORICAL_FEATURES,
+    CYCLICAL_FEATURES,
+    NUMERIC_FEATURES,
+    TARGET_FEATURE,
+    TIME_FEATURE,
+)
 from tzlocal import get_localzone
 
 from solaredge2mqtt.core.events import EventBus
 from solaredge2mqtt.core.exceptions import InvalidDataException
-from solaredge2mqtt.core.influxdb import InfluxDBAsync, Point
 from solaredge2mqtt.core.logging import logger
 from solaredge2mqtt.core.mqtt.events import MQTTPublishEvent
+from solaredge2mqtt.core.storage import Point, StorageService
 from solaredge2mqtt.core.timer.events import Interval10MinTriggerEvent
-from solaredge2mqtt.services.forecast.encoders import (
-    CategoricalEncoder,
-    CyclicalEncoder,
-    SunEncoder,
-    TimeEncoder,
-)
 from solaredge2mqtt.services.forecast.events import ForecastEvent
-from solaredge2mqtt.services.forecast.models import Forecast, ForecasterType
+from solaredge2mqtt.services.forecast.models import Forecast
 from solaredge2mqtt.services.forecast.settings import ForecastSettings
+from solaredge2mqtt.services.modbus.events import ModbusUnitsReadEvent
 from solaredge2mqtt.services.weather.events import WeatherUpdateEvent
-from solaredge2mqtt.services.weather.models import OpenWeatherMapForecastData
+from solaredge2mqtt.services.weather.result import WeatherSnapshot
 
 if TYPE_CHECKING:
     from solaredge2mqtt.core.settings.models import LocationSettings
@@ -42,27 +38,188 @@ if TYPE_CHECKING:
 
 LOCAL_TZ = get_localzone()
 
+#: Resolution of the weather forecast, the training data and the prediction.
+INTERVAL_MINUTES = 60
+
+ENERGY_FIELD = "energy"
+POWER_FIELD = "power"
+
+WH_PER_KWH = 1000
+
+TRAINING_MEASUREMENT = "forecast_training"
+
+FORECAST_MEASUREMENT = "forecast"
+
+TRAINING_START = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+HOURS_PER_DAY = 24
+
+THROTTLE_TRAINING_DAYS = 30
+THROTTLE_TRAINING_ROWS = THROTTLE_TRAINING_DAYS * HOURS_PER_DAY * 60 // INTERVAL_MINUTES
+
+FREQUENT_TRAINING_INTERVAL_HOURS = 1
+THROTTLED_TRAINING_INTERVAL_HOURS = 24
+
+DUE_TOLERANCE = timedelta(minutes=5)
+
+FORECAST_DAYS = 2
+
+MODEL_DIRECTORY = "model"
+
+
+#: The columns pvlearn trains and predicts on, in the order of its schema.
+PVLEARN_COLUMNS: tuple[str, ...] = (
+    TIME_FEATURE,
+    TARGET_FEATURE,
+    *NUMERIC_FEATURES,
+    *CATEGORICAL_FEATURES,
+    *CYCLICAL_FEATURES,
+)
+
+
+def frame_from_records(records: list[dict[str, Any]]) -> DataFrame:
+    if not records:
+        return DataFrame()
+
+    data = DataFrame(records)
+    data["_time"] = to_datetime(data["_time"], utc=True)
+    data["time"] = data["_time"].dt.tz_convert(LOCAL_TZ)
+
+    return data
+
+
+def frame_for_pvlearn(data: DataFrame) -> DataFrame:
+    """Reduce a stored frame to the canonical columns pvlearn knows.
+
+    The storage holds the canonical schema, so nothing is renamed here. Columns
+    outside the schema are dropped, columns a row predates are left missing;
+    the forecaster tolerates both.
+    """
+    return cast(
+        "DataFrame", data[[column for column in PVLEARN_COLUMNS if column in data]]
+    )
+
 
 class ForecastService:
     def __init__(
         self,
         settings: ForecastSettings,
         location: LocationSettings,
-        influxdb: InfluxDBAsync,
+        storage: StorageService,
     ) -> None:
         self.settings = settings
         self.location = location
 
-        self.influxdb = influxdb
+        self.storage = storage
 
-        self.forecasters: dict[ForecasterType, Forecaster] = {
-            typed: Forecaster(typed, location, settings) for typed in ForecasterType
-        }
+        forecaster_location = Location(
+            latitude=location.latitude_value,
+            longitude=location.longitude_value,
+            timezone=str(LOCAL_TZ),
+        )
+        forecaster_config = ForecasterConfig(
+            interval_minutes=INTERVAL_MINUTES,
+            hyperparametertuning=settings.hyperparametertuning,
+            cachingdir=settings.cachingdir,
+            cache_size_limit_mb=settings.cache_size_limit_mb,
+        )
+        self.forecaster_location = forecaster_location
+        self.forecaster_config = forecaster_config
 
-        self.last_weather_forecast: list[OpenWeatherMapForecastData] | None = None
-        self.last_hour_forecast: dict[int, OpenWeatherMapForecastData] | None = None
+        self.last_weather_forecast: list[WeatherSnapshot] | None = None
+        self.last_hour_forecast: dict[int, WeatherSnapshot] | None = None
+
+        self.last_battery_capacity_wh: float | None = None
+        self.last_battery_stored_energy_wh: float | None = None
+        self.last_battery_max_charge_power_w: float | None = None
+
+        self.last_training: datetime | None = None
+
+        self.forecaster = self._restore_forecaster()
 
         EventBus.register(self)
+
+    @property
+    def model_directory(self) -> Path | None:
+        if self.settings.cachingdir is None:
+            return None
+
+        return Path(self.settings.cachingdir) / MODEL_DIRECTORY
+
+    def _restore_forecaster(self) -> Forecaster:
+        directory = self.model_directory
+
+        if directory is not None:
+            try:
+                forecaster = Forecaster.load(
+                    directory, self.forecaster_location, self.forecaster_config
+                )
+            except ModelNotTrainedError:
+                logger.info(
+                    "No forecast model persisted in {directory}, training from scratch",
+                    directory=directory,
+                )
+            except SchemaMismatchError as error:
+                logger.warning(
+                    "Persisted forecast model cannot be used, "
+                    "training from scratch: {error}",
+                    error=error,
+                )
+            else:
+                if forecaster.metadata is not None:
+                    self.last_training = forecaster.metadata.trained_at
+
+                return forecaster
+
+        return Forecaster(self.forecaster_location, self.forecaster_config)
+
+    @EventBus.subscribe(ModbusUnitsReadEvent)
+    async def battery_update(self, event: ModbusUnitsReadEvent) -> None:
+        capacity_wh = 0.0
+        stored_energy_wh = 0.0
+        max_charge_power_w = 0.0
+        battery_found = False
+
+        for unit in event.units.values():
+            for battery in unit.batteries.values():
+                capacity_wh += battery.rated_energy
+                stored_energy_wh += battery.rated_energy * battery.state_of_charge / 100
+                max_charge_power_w += battery.maximum_charge_power
+                battery_found = True
+
+        if battery_found:
+            self.last_battery_capacity_wh = capacity_wh
+            self.last_battery_stored_energy_wh = stored_energy_wh
+            self.last_battery_max_charge_power_w = max_charge_power_w or None
+        else:
+            self.last_battery_capacity_wh = None
+            self.last_battery_stored_energy_wh = None
+            self.last_battery_max_charge_power_w = None
+
+    def battery_charge_needed_wh(self) -> float | None:
+        if not self.last_battery_capacity_wh:
+            return None
+
+        target_energy_wh = (
+            self.last_battery_capacity_wh * self.settings.battery_target_soc / 100
+        )
+        deficit_wh = target_energy_wh - (self.last_battery_stored_energy_wh or 0)
+
+        if deficit_wh <= 0:
+            return 0.0
+
+        return deficit_wh / self.settings.battery_charge_efficiency
+
+    def battery_charge_slot_cap_wh(self) -> float | None:
+        if not self.last_battery_max_charge_power_w:
+            return None
+
+        return (
+            self.last_battery_max_charge_power_w
+            * INTERVAL_MINUTES
+            / 60
+            / self.settings.battery_charge_efficiency
+        )
 
     @EventBus.subscribe(WeatherUpdateEvent)
     async def weather_update(self, event: WeatherUpdateEvent) -> None:
@@ -88,65 +245,140 @@ class ForecastService:
             await self.write_new_training_data(self.last_hour_forecast[last_hour.hour])
 
     async def write_new_training_data(
-        self, last_hour_weather_forecast: OpenWeatherMapForecastData
+        self, last_hour_weather_forecast: WeatherSnapshot
     ) -> None:
         now = datetime.now().astimezone()
         last_hour = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
 
-        training_data = last_hour_weather_forecast.model_dump_estimation_data()
+        training_data = last_hour_weather_forecast.model_dump_canonical()
         training_data["time"] = last_hour
         training_data = await self.add_last_hour_pv_production(training_data)
-        await self.write_new_training_data_to_influxdb(training_data)
+        await self.store_training_data(training_data)
 
         if (now.minute // 10) * 10 == 20:
-            await self.train()
+            await self.scheduled_training()
 
     async def add_last_hour_pv_production(
         self, trainings_data
     ) -> dict[str, str | float | int | None]:
-        production_data = await self.influxdb.query_first("production")
+        production_data = await self.storage.query_production_last_hour()
 
         if production_data is None:
             raise InvalidDataException(
                 "Missing production data of last hour for forecast training."
-                + " Did the service write power information to InfluxDB?"
+                + " Did the service write power information to the storage?"
             )
 
-        trainings_data[ForecasterType.POWER.target_column] = round(
-            production_data[ForecasterType.POWER.target_column]
-        )
-        trainings_data[ForecasterType.ENERGY.target_column] = round(
-            production_data[ForecasterType.ENERGY.target_column], 2
-        )
+        # Recorded but no longer a training target: the model predicts energy
+        # per interval only.
+        trainings_data[POWER_FIELD] = round(production_data[POWER_FIELD])
+        trainings_data[ENERGY_FIELD] = round(production_data[ENERGY_FIELD], 2)
         return trainings_data
 
-    async def write_new_training_data_to_influxdb(self, trainings_data):
-        point = Point("forecast_training")
+    async def store_training_data(self, trainings_data):
+        point = Point(TRAINING_MEASUREMENT)
         for key, value in trainings_data.items():
             if isinstance(value, (int, float, str, bool)):
                 point.field(key, value)
 
         point.time(trainings_data["time"].astimezone(timezone.utc))
 
-        logger.info("Write new forecast training data to influxdb")
+        logger.info("Write new forecast training data to storage")
         logger.debug(trainings_data)
-        await self.influxdb.write_point(point)
+        await self.storage.write_point(point)
 
-    async def train(self) -> None:
-        data = await self.influxdb.query_dataframe("training_data")
-        data["time"] = data["_time"].dt.tz_convert(LOCAL_TZ)
-        await to_thread(self.training, data)
+    async def read_training_data(self) -> DataFrame:
+        rows = await self.storage.query_pivot(
+            TRAINING_MEASUREMENT, int(TRAINING_START.timestamp())
+        )
 
-    def training(self, data: DataFrame) -> None:
-        for forecaster in self.forecasters.values():
-            forecaster.train(data)
+        return frame_from_records(rows)
+
+    async def scheduled_training(self) -> None:
+        data = await self.read_training_data()
+        if data.empty:
+            raise InvalidDataException("No forecast training data available")
+
+        interval_hours = self.training_interval_hours(len(data))
+
+        if not self._is_due(self.last_training, timedelta(hours=interval_hours)):
+            logger.info(
+                "Skipping forecast training, last trained at {last}, "
+                "retraining every {hours} hours",
+                last=self.last_training,
+                hours=interval_hours,
+            )
+            return
+
+        await self.train(data)
+
+    def training_interval_hours(self, rows: int) -> int:
+        if self.settings.training_interval_hours > 0:
+            return self.settings.training_interval_hours
+
+        if rows >= THROTTLE_TRAINING_ROWS:
+            return THROTTLED_TRAINING_INTERVAL_HOURS
+
+        return FREQUENT_TRAINING_INTERVAL_HOURS
+
+    def hyperparametertuning_due(self) -> bool:
+        if not self.settings.hyperparametertuning:
+            return False
+
+        interval_days = self.settings.hyperparametertuning_interval_days
+        if interval_days <= 0:
+            return True
+
+        return self._is_due(
+            self.forecaster.hyperparameters_tuned_at, timedelta(days=interval_days)
+        )
+
+    @staticmethod
+    def _is_due(last_run: datetime | None, interval: timedelta) -> bool:
+        if last_run is None:
+            return True
+
+        return datetime.now().astimezone() - last_run >= interval - DUE_TOLERANCE
+
+    async def train(self, data: DataFrame | None = None) -> None:
+        if data is None:
+            data = await self.read_training_data()
+
+        if data.empty:
+            raise InvalidDataException("No forecast training data available")
+
+        await to_thread(self.training, data, self.hyperparametertuning_due())
+
+        self.last_training = datetime.now().astimezone()
+
+    def training(self, data: DataFrame, hyperparametertuning: bool = False) -> None:
+        try:
+            self.forecaster.train(
+                frame_for_pvlearn(data), hyperparametertuning=hyperparametertuning
+            )
+        except PVLearnError as error:
+            raise InvalidDataException(str(error)) from error
+
+        self.save_model()
+
+    def save_model(self) -> None:
+        directory = self.model_directory
+        if directory is None:
+            return
+
+        try:
+            self.forecaster.save(directory)
+        except (PVLearnError, OSError) as error:
+            logger.warning("Could not persist the forecast model: {error}", error=error)
 
     @EventBus.subscribe(Interval10MinTriggerEvent)
     async def forecast_loop(self, event: Interval10MinTriggerEvent) -> None:
-        if (
-            not self.forecasters[ForecasterType.ENERGY].is_trained
-            or not self.forecasters[ForecasterType.POWER].is_trained
-        ):
+        predictions = await self.predict()
+        await self._write_periods(predictions)
+        await self.publish_forecast()
+
+    async def predict(self) -> DataFrame:
+        if not self.forecaster.is_trained:
             await self.train()
 
         if self.last_weather_forecast is None:
@@ -154,6 +386,60 @@ class ForecastService:
                 "Missing weather forecast for production forecast"
             )
 
+        data = self._prepare_estimation_data(self.last_weather_forecast)
+
+        try:
+            return await self.forecaster.predict(data)
+        except PVLearnError as error:
+            raise InvalidDataException(str(error)) from error
+
+    async def predict_elapsed_today(self) -> DataFrame:
+        """Predict the hours of today that are already over.
+
+        The weather forecast starts at the current hour, so the elapsed hours
+        are reconstructed from the snapshots stored in `forecast_training`.
+        Returns an empty frame when today has no stored hours yet.
+        """
+        if not self.forecaster.is_trained:
+            await self.train()
+
+        data = await self.read_training_data()
+        if data.empty:
+            return DataFrame()
+
+        hour_start = (
+            datetime.now().astimezone().replace(minute=0, second=0, microsecond=0)
+        )
+        day_start = hour_start.replace(hour=0)
+
+        elapsed = cast(
+            DataFrame, data[(data["time"] >= day_start) & (data["time"] < hour_start)]
+        )
+        if elapsed.empty:
+            logger.warning(
+                "No stored weather between {day_start} and {hour_start}, "
+                "the elapsed hours of today stay out of the forecast "
+                "(latest stored hour: {latest})",
+                day_start=day_start,
+                hour_start=hour_start,
+                latest=data["time"].max(),
+            )
+            return DataFrame()
+
+        logger.info(
+            "Reconstructing {count} elapsed hours of today from stored weather",
+            count=len(elapsed),
+        )
+
+        try:
+            return await self.forecaster.predict(frame_for_pvlearn(elapsed))
+        except PVLearnError as error:
+            raise InvalidDataException(str(error)) from error
+
+    @staticmethod
+    def _prepare_estimation_data(
+        weather_forecast_list: list[WeatherSnapshot],
+    ) -> DataFrame:
         estimation_data_list = [
             {
                 "time": datetime(
@@ -165,66 +451,67 @@ class ForecastService:
                     second=0,
                     microsecond=0,
                 ).astimezone(),
-                **weather_forecast.model_dump_estimation_data(),
+                **weather_forecast.model_dump_canonical(),
             }
-            for weather_forecast in self.last_weather_forecast
+            for weather_forecast in weather_forecast_list
         ]
 
         data = DataFrame(estimation_data_list)
         data["time"] = to_datetime(data["time"], utc=True).dt.tz_convert(LOCAL_TZ)
 
-        for typed, forecaster in self.forecasters.items():
-            predicted_data = await forecaster.predict(data)
-            await self._write_periods_to_influxdb(predicted_data, typed)
+        return data
 
-        await self.publish_forecast()
-
-    async def _write_periods_to_influxdb(
-        self, periods: DataFrame, typed: ForecasterType
-    ) -> None:
+    async def _write_periods(self, periods: DataFrame) -> None:
         points = []
         for _, period in periods.iterrows():
-            point = Point("forecast")
-            point.field(typed.target_column, period[typed.target_column])
+            energy_wh = period[ENERGY_FIELD]
             period_time = period["time"]
             if not isinstance(period_time, datetime):
                 raise InvalidDataException("Forecast period time must be datetime")
+            if not isinstance(energy_wh, (int, float)):
+                raise InvalidDataException("Forecast energy value must be numeric")
 
-            utc_time = period_time.astimezone(timezone.utc)
-            point.time(utc_time)
+            point = Point(FORECAST_MEASUREMENT)
+            # pvlearn publishes Wh, this measurement stores kWh.
+            point.field(ENERGY_FIELD, energy_wh / WH_PER_KWH)
+            # Deprecated, mirrors the energy: at 60 minutes the mean power in W
+            # equals the energy in Wh. Written as an integer, the type the
+            # field has carried since the power model wrote it.
+            point.field(POWER_FIELD, int(round(energy_wh)))
+
+            point.time(period_time.astimezone(timezone.utc))
             points.append(point)
 
-        logger.info("Write forecast data to influxdb")
-        await self.influxdb.write_points(points)
+        logger.info("Write forecast data to storage")
+        await self.storage.write_points(points)
 
     async def publish_forecast(self) -> None:
-        forecast_data = await self.influxdb.query_dataframe("forecast")
+        rows = await self.storage.query_days(FORECAST_MEASUREMENT, FORECAST_DAYS)
+        forecast_data = frame_from_records(rows)
         if not forecast_data.empty:
-            forecast_data["time"] = forecast_data["_time"].dt.tz_convert(LOCAL_TZ)
-            power_hours: dict[datetime, int] = {}
             energy_hours: dict[datetime, int] = {}
             for _, row in forecast_data.iterrows():
                 row_time = row["time"]
-                row_power = row["power"]
-                row_energy = row["energy"]
+                row_energy = row[ENERGY_FIELD]
 
                 if not isinstance(row_time, datetime):
                     raise InvalidDataException(
                         "Forecast row time must be datetime",
-                    )
-                if not isinstance(row_power, (int, float)):
-                    raise InvalidDataException(
-                        "Forecast power value must be numeric",
                     )
                 if not isinstance(row_energy, (int, float)):
                     raise InvalidDataException(
                         "Forecast energy value must be numeric",
                     )
 
-                power_hours[row_time] = int(round(row_power))
-                energy_hours[row_time] = int(round(row_energy * 1000))
+                energy_hours[row_time] = int(round(row_energy * WH_PER_KWH))
 
-            forecast = Forecast(power_period=power_hours, energy_period=energy_hours)
+            forecast = Forecast.from_energy_period(
+                energy_hours,
+                timezone=str(LOCAL_TZ),
+                battery_charge_needed_wh=self.battery_charge_needed_wh(),
+                battery_charge_slot_cap_wh=self.battery_charge_slot_cap_wh(),
+                production_threshold_wh=self.settings.production_threshold_wh,
+            )
             logger.debug(forecast)
 
             await EventBus.emit(
@@ -235,263 +522,3 @@ class ForecastService:
                 )
             )
             await EventBus.emit(ForecastEvent(forecast))
-
-
-class Forecaster:
-    NUMERIC_FEATURES: list[str] = [
-        "clouds",
-        "dew_point",
-        "feels_like",
-        "humidity",
-        "pop",
-        "pressure",
-        "rain",
-        "temp",
-        "uvi",
-        "visibility",
-        "wind_speed",
-        "wind_gust",
-    ]
-    CATEGORICAL_FEATURES: list[str] = ["weather_id", "weather_main"]
-    CYCLICAL_FEATURES: dict[str, int] = {
-        "wind_deg": 360,
-    }
-    TARGET_FEATURES: dict[str, str] = {
-        ForecasterType.ENERGY.target_column: "energy",
-        ForecasterType.POWER.target_column: "power",
-    }
-
-    def __init__(
-        self,
-        typed: ForecasterType,
-        location: LocationSettings,
-        settings: ForecastSettings,
-    ) -> None:
-        self.typed: ForecasterType = typed
-        self.location = location
-        self.enable_hyperparameter_tuning = settings.hyperparametertuning
-        self.model_pipeline: Pipeline | None = None
-        self.training_completed: Event = Event()
-        self.cache_size_limit_bytes = settings.cache_size_limit_mb * 1024 * 1024
-
-        self.memory: Memory | None = (
-            Memory(settings.cachingdir, verbose=0)
-            if settings.is_caching_enabled
-            else None
-        )
-
-    def train(self, data: DataFrame) -> None:
-        data_count = len(data)
-        logger.info(
-            f"Training model {self.typed} with {data_count} hours of data points"
-        )
-
-        if data_count < 60:
-            raise InvalidDataException(
-                "Forecast needs at least 60 hours of data at least to start training",
-            )
-
-        self.training_completed.clear()
-        start_time = time.time()
-        y_vector = cast(Series, data[self.typed.target_column])
-
-        pipeline = self._prepare_model_pipeline(data.columns.to_list())
-
-        if self.enable_hyperparameter_tuning:
-            self.model_pipeline = self._hyperparametertuning(data, y_vector, pipeline)
-        else:
-            self.model_pipeline = pipeline
-
-        self.model_pipeline.fit(data, y_vector)
-        self._cleanup_cache()
-
-        execution_time = time.time() - start_time
-        self.training_completed.set()
-
-        transformed_features = self.model_pipeline.named_steps[
-            "preprocessor"
-        ].get_feature_names_out()
-        logger.debug(
-            "Transformed features ({count}): {features} ",
-            count=len(transformed_features),
-            features=", ".join(transformed_features),
-        )
-
-        selected_features = self.model_pipeline.named_steps[
-            "feature_selector"
-        ].important_features_
-        logger.info(
-            "Selected features ({count}): {features} ",
-            count=len(selected_features),
-            features=", ".join(selected_features),
-        )
-
-        logger.info(f"Training execution time: {execution_time:.2f} seconds")
-
-    def _prepare_model_pipeline(
-        self, x_vector_columns: list[str], n_repeats: int = 10
-    ) -> Pipeline:
-        base_estimator = HistGradientBoostingRegressor(
-            random_state=42,
-            categorical_features="from_dtype",
-            learning_rate=0.1,
-        )
-
-        return Pipeline(
-            steps=[
-                ("preprocessor", self._prepare_preprocessor(x_vector_columns)),
-                (
-                    "feature_selector",
-                    PFISelector(estimator=clone(base_estimator), n_repeats=n_repeats),
-                ),
-                ("model", clone(base_estimator)),
-            ],
-            memory=self.memory,
-        )
-
-    def _prepare_preprocessor(self, x_vector_columns: list[str]) -> ColumnTransformer:
-        ct = ColumnTransformer(
-            transformers=[
-                (
-                    "cyc",
-                    CyclicalEncoder(**self.CYCLICAL_FEATURES),
-                    self._extract_used_columns(
-                        self.CYCLICAL_FEATURES, x_vector_columns
-                    ),
-                ),
-                (
-                    "num",
-                    "passthrough",
-                    self._extract_used_columns(self.NUMERIC_FEATURES, x_vector_columns),
-                ),
-                (
-                    "time",
-                    TimeEncoder(),
-                    ["time"],
-                ),
-                ("sun", SunEncoder(self.location), ["time"]),
-                (
-                    "cat",
-                    CategoricalEncoder(),
-                    self._extract_used_columns(
-                        self.CATEGORICAL_FEATURES, x_vector_columns
-                    ),
-                ),
-            ],
-            remainder="drop",
-        )
-        ct.set_output(transform="pandas")
-        return ct
-
-    def _hyperparametertuning(
-        self,
-        data: DataFrame,
-        y_vector: Series,
-        pipeline: Pipeline,
-    ) -> Pipeline:
-        param_grid = {
-            "model__max_iter": [100, 200, 300],
-            "model__max_depth": [None, 5, 10],
-            "model__learning_rate": [0.01, 0.1],
-        }
-
-        grid_search = GridSearchCV(
-            estimator=pipeline,
-            param_grid=param_grid,
-            cv=TimeSeriesSplit(n_splits=2),
-            scoring="neg_mean_squared_error",
-        )
-        grid_search.fit(data, y_vector)
-
-        logger.info(
-            "Training with best parameters: {params}", params=grid_search.best_params_
-        )
-        logger.info("Training with best score: {score}", score=grid_search.best_score_)
-
-        return cast(Pipeline, clone(grid_search.best_estimator_))
-
-    def _cleanup_cache(self) -> None:
-        if self.memory is None:
-            return
-
-        self.memory.reduce_size(bytes_limit=self.cache_size_limit_bytes)
-
-    @staticmethod
-    def _extract_used_columns(
-        typed_features: list[str] | dict[str, int], x_vector_columns: list[str]
-    ) -> list[str]:
-        return [col for col in typed_features if col in x_vector_columns]
-
-    @property
-    def is_trained(self) -> bool:
-        return self.model_pipeline is not None
-
-    async def predict(self, new_data: DataFrame) -> DataFrame:
-        if self.model_pipeline is None:
-            raise InvalidDataException("The model has not been trained yet.")
-
-        data_for_prediction = new_data.copy()
-
-        await self.training_completed.wait()
-
-        predictions = self.model_pipeline.predict(data_for_prediction)
-        if isinstance(predictions, tuple):
-            predictions = predictions[0]
-        data_for_prediction[self.typed.target_column] = predictions
-        data_for_prediction[self.typed.target_column] = data_for_prediction[
-            self.typed.target_column
-        ].apply(self.typed.prepare_value)
-
-        return data_for_prediction
-
-
-class PFISelector(BaseEstimator, TransformerMixin):
-    def __init__(self, estimator, n_repeats=10):
-        self.estimator = estimator
-        self.n_repeats = n_repeats
-        self.important_features_: list[str] | None = None
-        self.important_indices_: list[bool] | None = None
-
-    def fit(self, x_vector: DataFrame, y_vector=None) -> PFISelector:
-        x_train, x_test, y_train, y_test = train_test_split(
-            x_vector, y_vector, test_size=0.1, random_state=42
-        )
-        self.estimator_ = self.estimator.fit(x_train, y_train)
-        results = permutation_importance(
-            self.estimator_,
-            x_test,
-            y_test,
-            n_repeats=self.n_repeats,
-            random_state=42,
-            n_jobs=-1,
-        )
-
-        self.feature_importances_ = cast(
-            NDArray,
-            results["importances_mean"],
-        )
-
-        threshold_value = percentile(self.feature_importances_, 75)
-
-        selected = self.feature_importances_ > threshold_value
-        if not selected.any():
-            selected = self.feature_importances_ >= threshold_value
-
-        important_indices = cast(list[bool], selected.tolist())
-        self.important_indices_ = important_indices
-        self.important_features_ = [
-            col
-            for col, keep in zip(x_vector.columns.to_list(), important_indices)
-            if keep
-        ]
-        return self
-
-    def transform(self, x_vector: DataFrame) -> DataFrame:
-        if self.important_features_ is None:
-            raise RuntimeError("PFISelector has not been fitted yet.")
-        return cast(DataFrame, x_vector.loc[:, self.important_features_])
-
-    def get_support(self, *_) -> list[bool]:
-        if self.important_indices_ is None:
-            raise RuntimeError("PFISelector has not been fitted yet.")
-        return self.important_indices_

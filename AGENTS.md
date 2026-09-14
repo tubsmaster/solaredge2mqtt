@@ -7,20 +7,23 @@ tool-specific syntax on top.
 ## Project Overview
 
 - **Purpose:** Integrates SolarEdge inverters with MQTT for home automation, logging, and forecasting.
-- **Language:** Python (>=3.11, <=3.13)
+- **Language:** Python (>=3.12, <=3.13)
 - **Package Manager:** pip with `pyproject.toml`
 
 ### Directory Structure
 
 ```
 solaredge2mqtt/
-├── core/           # Event bus, logging, settings, MQTT, InfluxDB, timer
+├── core/           # Event bus, logging, settings, MQTT, storage, timer
 ├── services/       # Modular services (energy, forecast, homeassistant, modbus,
 │                   #   monitoring, powerflow, wallbox, weather)
 ├── __main__.py     # Entrypoint for CLI/console mode
 └── service.py      # Main service orchestration logic
 tests/              # Unit and integration tests mirroring solaredge2mqtt/ structure
 examples/           # Docker Compose, Grafana, and other example configs
+docs/               # MkDocs site sources, published to GitHub Pages
+└── decisions/      # Architecture decision records, numbered and append-only
+mkdocs.yml          # Site configuration and navigation
 ```
 
 ### Architecture & Data Flow
@@ -29,15 +32,15 @@ examples/           # Docker Compose, Grafana, and other example configs
   `core/timer/events`). Subscribe via `event_bus.subscribe()`, emit via `event_bus.emit()`.
 - **Service boundaries:** Each service is isolated under `services/` with its own `settings.py`,
   `models.py`, and `events.py`.
-- **Data flow:** Inverter data (Modbus, Monitoring, Wallbox) → aggregated → InfluxDB + MQTT.
-  Forecasting uses historical InfluxDB data and OpenWeatherMap.
+- **Data flow:** Inverter data (Modbus, Monitoring, Wallbox) → aggregated → local storage + MQTT.
+  Forecasting uses the locally stored history and OpenWeatherMap.
 
 ### Integration Points
 
 | System | Role |
 |---|---|
 | MQTT | Publishes inverter/sensor data for home automation (`core/mqtt/`) |
-| InfluxDB | Logs raw and aggregated time-series data (`core/influxdb/`) |
+| SQLite | Logs raw and aggregated time-series data locally (`core/storage/`) |
 | Home Assistant | Auto-discovery support (`services/homeassistant/`) |
 | Modbus | TCP/IP communication with SolarEdge inverters |
 | OpenWeatherMap | Weather data for PV production forecasting |
@@ -66,6 +69,11 @@ python -m solaredge2mqtt
 # Docker
 docker build -t solaredge2mqtt .
 docker compose up -d
+
+# Documentation site
+uv sync --extra docs
+uv run mkdocs serve          # local preview with live reload
+uv run mkdocs build --strict # fails on any dead internal link
 ```
 
 ---
@@ -78,9 +86,13 @@ and applied automatically to `*.py` files.
 
 Project-specific constraints:
 
-- Use Python >=3.11, <=3.13 syntax and language features.
+- Use Python >=3.12, <=3.13 syntax and language features.
 - All code comments and documentation must be in **English**.
 - For diagrams use Mermaid.
+- User documentation lives in `docs/` and is published with MkDocs Material. A new page must be
+  added to the `nav` block of `mkdocs.yml`, otherwise `mkdocs build --strict` fails.
+- `README.md` is the PyPI project page. Keep it a landing page and link into the site with
+  absolute URLs, never relative paths.
 
 ### Project Patterns
 
@@ -103,6 +115,7 @@ Project-specific constraints:
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
+
 class MyServiceSettings(BaseSettings):
     enable: bool = Field(default=False, description="Enable the service")
     host: str = Field(default="localhost", description="Service host")
@@ -115,6 +128,7 @@ class MyServiceSettings(BaseSettings):
 from dataclasses import dataclass
 from solaredge2mqtt.core.events import BaseEvent
 
+
 @dataclass
 class MyServiceEvent(BaseEvent):
     data: dict
@@ -126,16 +140,18 @@ class MyServiceEvent(BaseEvent):
 - Use `pytest` with `pytest-asyncio`; fixtures in `tests/conftest.py`.
 - Test classes prefixed with `Test`; methods prefixed with `test_`.
 - Async tests use `@pytest.mark.asyncio` (auto mode enabled).
-- Mock all external services (MQTT, InfluxDB, Modbus, HTTP APIs).
+- Mock all external services (MQTT, Modbus, HTTP APIs). Storage tests run against a real
+  temporary database file, see `tests/core/storage/conftest.py`.
 - All new code must be covered by unit tests; minimum coverage threshold is **90 %**.
 
 **Example mock pattern:**
 ```python
 from unittest.mock import AsyncMock, patch
 
+
 @pytest.fixture
 def mock_mqtt():
-    with patch('solaredge2mqtt.core.mqtt.MQTTClient') as mock:
+    with patch("solaredge2mqtt.core.mqtt.MQTTClient") as mock:
         mock.publish = AsyncMock()
         yield mock
 ```

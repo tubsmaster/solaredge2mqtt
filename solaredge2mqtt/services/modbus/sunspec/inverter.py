@@ -130,59 +130,6 @@ class SunSpecGridStatusRegister(SunSpecRegister):
     GRID_STATUS = "grid_status", 40113, SunSpecValueType.UINT32, True
 
 
-class SunSpecPowerControlRegister(SunSpecRegister):
-    RRCR_STATE = "rrcr_state", 61440, SunSpecValueType.UINT16, True
-    ACTIVE_POWER_LIMIT = ("active_power_limit", 61441, SunSpecValueType.UINT16, True)
-    COSPHI = "cosphi", 61442, SunSpecValueType.FLOAT32, False
-
-    COMMIT_POWER_CONTROL_SETTINGS = (
-        "commit_power_control_settings",
-        61696,
-        SunSpecValueType.INT16,
-        True,
-    )
-    RESTORE_POWER_CONTROL_SETTINGS = (
-        "restore_power_control_settings",
-        61697,
-        SunSpecValueType.INT16,
-        True,
-    )
-
-    ADVANCED_POWER_CONTROL_ENABLE = (
-        "advanced_power_control_enable",
-        61762,
-        SunSpecValueType.INT32,
-        True,
-    )
-
-    REACTIVE_POWER_CONFIG = (
-        "reactive_power_config",
-        61700,
-        SunSpecValueType.INT32,
-        True,
-    )
-    REACTIVE_POWER_RESPONSE_TIME = (
-        "reactive_power_response_time",
-        61702,
-        SunSpecValueType.UINT32,
-        True,
-    )
-
-    def decode_response(
-        self, registers: list[int], data: SunSpecPayload
-    ) -> SunSpecPayload:
-        data = super().decode_response(registers, data)
-
-        if self == SunSpecPowerControlRegister.ADVANCED_POWER_CONTROL_ENABLE:
-            data[self.identifier] = data[self.identifier] == 1
-
-        return data
-
-    @staticmethod
-    def wordorder() -> SunSpecWordOrder:
-        return "little"
-
-
 class SunSpecSiteLimitRegister(SunSpecRegister):
     EXPORT_CONTROL_MODE = ("export_control_mode", 57344, SunSpecValueType.UINT16, True)
     EXPORT_CONTROL_LIMIT_MODE = (
@@ -219,6 +166,82 @@ class SunSpecSiteLimitRegister(SunSpecRegister):
 
             data["export_control_external_production"] = bool(bitmask & 0x0400)
             data["export_control_negative_site_limit"] = bool(bitmask & 0x0800)
+
+        return data
+
+    @staticmethod
+    def wordorder() -> SunSpecWordOrder:
+        return "little"
+
+
+class SunSpecStorEdgeControlRegister(SunSpecRegister):
+    STORAGE_CONTROL_MODE = (
+        "storage_control_mode",
+        57348,
+        SunSpecValueType.UINT16,
+        True,
+    )
+    STORAGE_AC_CHARGE_POLICY = (
+        "storage_ac_charge_policy",
+        57349,
+        SunSpecValueType.UINT16,
+        True,
+    )
+    STORAGE_AC_CHARGE_LIMIT = (
+        "storage_ac_charge_limit",
+        57350,
+        SunSpecValueType.FLOAT32,
+        True,
+    )
+    STORAGE_BACKUP_RESERVED_SETTING = (
+        "storage_backup_reserved_setting",
+        57352,
+        SunSpecValueType.FLOAT32,
+        True,
+    )
+    STORAGE_DEFAULT_MODE = (
+        "storage_default_mode",
+        57354,
+        SunSpecValueType.UINT16,
+        True,
+    )
+    REMOTE_CONTROL_COMMAND_TIMEOUT = (
+        "remote_control_command_timeout",
+        57355,
+        SunSpecValueType.UINT32,
+        True,
+    )
+    REMOTE_CONTROL_COMMAND_MODE = (
+        "remote_control_command_mode",
+        57357,
+        SunSpecValueType.UINT16,
+        True,
+    )
+    REMOTE_CONTROL_CHARGE_LIMIT = (
+        "remote_control_charge_limit",
+        57358,
+        SunSpecValueType.FLOAT32,
+        True,
+    )
+    REMOTE_CONTROL_DISCHARGE_LIMIT = (
+        "remote_control_discharge_limit",
+        57360,
+        SunSpecValueType.FLOAT32,
+        True,
+    )
+
+    def decode_response(
+        self, registers: list[int], data: SunSpecPayload
+    ) -> SunSpecPayload:
+        data = super().decode_response(registers, data)
+
+        if self in (
+            SunSpecStorEdgeControlRegister.STORAGE_AC_CHARGE_LIMIT,
+            SunSpecStorEdgeControlRegister.STORAGE_BACKUP_RESERVED_SETTING,
+            SunSpecStorEdgeControlRegister.REMOTE_CONTROL_CHARGE_LIMIT,
+            SunSpecStorEdgeControlRegister.REMOTE_CONTROL_DISCHARGE_LIMIT,
+        ):
+            data[self.identifier] = max(0.0, float(data[self.identifier]))
 
         return data
 

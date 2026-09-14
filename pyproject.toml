@@ -3,7 +3,7 @@ name = "solaredge2mqtt"
 dynamic = ["version"]
 description = "Read data from SolarEdge Inverter and publish it to MQTT"
 readme = { file = "README.md", content-type = "text/markdown" }
-requires-python = ">=3.11,<4"
+requires-python = ">=3.12,<4"
 license = "MIT"
 authors = [
     { name = "Johannes Ott", email = "info@johannes-ott.net" }
@@ -14,7 +14,6 @@ classifiers = [
     "Topic :: Home Automation",
     "Natural Language :: English",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
@@ -22,22 +21,20 @@ dependencies = [
     "aiocsv==1.4.1",
     "aiohttp==3.14.3",
     "aiomqtt==2.5.1",
-    "astral==3.2",
-    "ephem==4.2.1",
-    "influxdb-client==1.50.0",
+    "aiosqlite==0.21.0",
     "jsonref==1.1.0",
     "loguru==0.7.3",
-    "platformdirs==4.11.2",
+    "platformdirs==4.11.3",
     "pydantic==2.13.4",
     "pyjwt==2.13.0",
-    "pymodbus==3.14.0",
+    "pymodbus==3.15.0",
     "pyyaml==6.0.3",
     "tzlocal==5.4.4",
 ]
 
 [project.urls]
 Homepage = "https://github.com/DerOetzi/solaredge2mqtt"
-Documentation = "https://github.com/DerOetzi/solaredge2mqtt/README.md"
+Documentation = "https://deroetzi.github.io/solaredge2mqtt/"
 Repository = "https://github.com/DerOetzi/solaredge2mqtt"
 Issues = "https://github.com/DerOetzi/solaredge2mqtt/issues"
 
@@ -45,23 +42,26 @@ Issues = "https://github.com/DerOetzi/solaredge2mqtt/issues"
 solaredge2mqtt = "solaredge2mqtt.__main__:main"
 solaredge2mqtt-migrate = "migrate_config:main"
 solaredge2mqtt-monitoring = "monitoring:main"
+solaredge2mqtt-forecast = "forecast:main"
+solaredge2mqtt-migrate-influxdb = "migrate_influxdb:main"
 
 [project.optional-dependencies]
 dev = [
     "setuptools-scm[toml]>=8",
     "ruff",
-    "tomli",
     "pyright==1.1.411",
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
     "pytest-cov==7.1.0",
     "pytest-xdist==3.8.0",
+    "pyarrow==25.0.0",
 ]
 forecast = [
-    "numpy==2.4.6",
-    "pandas==3.0.3",
-    "scikit-learn==1.9.0",
-    "scipy==1.17.1"
+    "pvlearn==0.5.0",
+]
+docs = [
+    "mkdocs==1.6.1",
+    "mkdocs-material==9.7.7",
 ]
 
 [build-system]
@@ -78,12 +78,13 @@ include = ["solaredge2mqtt*"]
 exclude = ["tests*"]
 
 [tool.setuptools]
-py-modules = ["migrate_config", "monitoring"]
+py-modules = ["migrate_config", "monitoring", "forecast", "migrate_influxdb"]
 
 [tool.setuptools_scm]
 version_scheme = "post-release"
 local_scheme = "node-and-date"
 fallback_version = "0.0.0.unknown"
+version_file = "solaredge2mqtt/_version.py"
 
 [tool.ruff]
 line-length = 88

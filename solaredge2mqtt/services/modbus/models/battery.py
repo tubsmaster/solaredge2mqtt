@@ -1,9 +1,9 @@
 from typing import Any
 
-from influxdb_client.client.write.point import Point
 from pydantic import Field
 
 from solaredge2mqtt.core.logging import logger
+from solaredge2mqtt.core.storage import Point
 from solaredge2mqtt.services.homeassistant.models import (
     HomeAssistantSensorType as HASensor,
 )
@@ -24,14 +24,15 @@ class ModbusBattery(ModbusComponent):
     power: float = Field(**HASensor.POWER_W.field("power"))
     state_of_charge: float = Field(**HASensor.BATTERY.field("state of charge"))
     state_of_health: float = Field(**HASensor.BATTERY.field("state of health"))
-
     lifetime_export: int = Field(**HASensor.BATTERY.field("lifetime_export_energy_counter"))
     lifetime_import: int = Field(**HASensor.BATTERY.field("lifetime_import_energy_counter"))
-    maximum_energy: int = Field(
-        **HASensor.ENERGY_MEASUREMENT_WH.field("maximum_energy")
-    )
+    maximum_energy: int = Field(**HASensor.ENERGY_STORAGE_WH.field("maximum_energy"))
     available_energy: float = Field(
-        **HASensor.ENERGY_MEASUREMENT_WH.field("available_energy")
+        **HASensor.ENERGY_STORAGE_WH.field("available_energy")
+    )
+    rated_energy: float = Field(**HASensor.ENERGY_STORAGE_WH.field("rated_energy"))
+    maximum_charge_power: float = Field(
+        **HASensor.POWER_W.field("maximum_charge_power")
     )
 
     @classmethod
@@ -47,6 +48,10 @@ class ModbusBattery(ModbusComponent):
             "lifetime_import": int(payload["lifetime_import_energy_counter"]),
             "maximum_energy": round(float(payload["maximum_energy"])),
             "available_energy": round(float(payload["available_energy"]), 2),
+            "rated_energy": round(float(payload["rated_energy"])),
+            "maximum_charge_power": round(
+                float(payload["maximum_charge_continuous_power"])
+            ),
         }
 
         if values["status"] in BATTERY_STATUS_MAP:

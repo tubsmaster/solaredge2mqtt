@@ -107,6 +107,82 @@ class TestConfigurationMigrator:
 
         assert result == {"se2mqtt_token": "abc"}
 
+    def test_environment_reader_read_dotenv_custom_path(self):
+        """A dotenv outside the working directory is read when named."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dotenv = Path(tmpdir, "prod.env")
+            dotenv.write_text(
+                "SE2MQTT_MODBUS__HOST=192.168.9.9\n"
+                "not_prefixed=ignored\n"
+                "SE2MQTT_MQTT__BROKER=broker.example.org\n",
+                encoding="utf-8",
+            )
+
+            result = dict(EnvironmentReader._read_dotenv(str(dotenv)))
+
+        assert result == {
+            "SE2MQTT_MODBUS__HOST": "192.168.9.9",
+            "SE2MQTT_MQTT__BROKER": "broker.example.org",
+        }
+
+    def test_environment_reader_read_dotenv_missing_custom_path(self):
+        """A named dotenv that does not exist yields nothing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = str(Path(tmpdir, "absent.env"))
+
+            assert list(EnvironmentReader._read_dotenv(missing)) == []
+
+    def test_environment_reader_read_all_passes_dotenv_path(self):
+        """read_all hands the dotenv path down to the dotenv reader."""
+        with (
+            patch.object(EnvironmentReader, "_read_environment", return_value=[]),
+            patch.object(EnvironmentReader, "_read_secrets", return_value=[]),
+            patch.object(
+                EnvironmentReader, "_read_dotenv", return_value=[]
+            ) as read_dotenv,
+        ):
+            EnvironmentReader.read_all("custom.env")
+
+        read_dotenv.assert_called_once_with("custom.env")
+
+    def test_migrator_uses_configured_dotenv_path(self):
+        """The migrator forwards the path it was constructed with."""
+        migrator = ConfigurationMigrator(dotenv_path="custom.env")
+        environment = {
+            "SE2MQTT_MODBUS__HOST": "192.168.9.9",
+            "SE2MQTT_MQTT__BROKER": "broker.example.org",
+        }
+
+        with patch.object(
+            EnvironmentReader, "read_all", return_value=environment
+        ) as read_all:
+            migrated = migrator.migrate()
+
+        read_all.assert_called_once_with("custom.env")
+        assert migrated.modbus.host == "192.168.9.9"
+
+    def test_extract_from_environment_uses_configured_dotenv_path(self):
+        """The export path forwards the same dotenv path."""
+        migrator = ConfigurationMigrator(dotenv_path="custom.env")
+        environment = {
+            "SE2MQTT_MODBUS__HOST": "192.168.9.9",
+            "SE2MQTT_MQTT__BROKER": "broker.example.org",
+        }
+
+        with patch.object(
+            EnvironmentReader, "read_all", return_value=environment
+        ) as read_all:
+            config_data, _ = migrator.extract_from_environment()
+
+        read_all.assert_called_once_with("custom.env")
+        assert config_data["modbus"]["host"] == "192.168.9.9"
+
+    def test_migrator_defaults_to_no_dotenv_path(self):
+        """Without a path the reader falls back to its own default."""
+        migrator = ConfigurationMigrator()
+
+        assert migrator.dotenv_path is None
+
     def test_environment_reader_read_dotenv_filenotfound(self):
         """Test dotenv reader handles file-not-found race condition."""
         with (
@@ -117,6 +193,41 @@ class TestConfigurationMigrator:
             patch("builtins.open", side_effect=FileNotFoundError),
         ):
             assert list(EnvironmentReader._read_dotenv()) == []
+
+    def test_legacy_influxdb_keys_that_survived_move_to_storage(self):
+        """The two settings the storage kept are read from the old names."""
+        migrator = ConfigurationMigrator()
+
+        config_data = migrator._parse_environment_to_dict(
+            {
+                "SE2MQTT_INFLUXDB__RETENTION_RAW": "12",
+                "SE2MQTT_INFLUXDB__DEBOUNCE_CYCLES": "7",
+            }
+        )
+
+        assert config_data == {
+            "storage": {"retention_raw": "12", "debounce_cycles": "7"}
+        }
+
+    def test_obsolete_influxdb_keys_are_dropped(self):
+        """The connection settings have no counterpart in the local storage."""
+        migrator = ConfigurationMigrator()
+
+        config_data = migrator._parse_environment_to_dict(
+            {
+                "SE2MQTT_INFLUXDB__HOST": "influx.local",
+                "SE2MQTT_INFLUXDB__TOKEN": "secret",
+                "SE2MQTT_MODBUS__HOST": "192.168.9.9",
+            }
+        )
+
+        assert config_data == {"modbus": {"host": "192.168.9.9"}}
+
+    def test_the_bare_influxdb_key_is_dropped(self):
+        """A prefix without a subkey must not index past the end of the list."""
+        migrator = ConfigurationMigrator()
+
+        assert migrator._parse_environment_to_dict({"SE2MQTT_INFLUXDB": "on"}) == {}
 
     def test_insert_nested_key_simple(self):
         """Test inserting a simple key-value pair."""
@@ -368,7 +479,6 @@ class TestConfigurationMigrator:
                 "password": SecretStr("secret123"),
             },
             "weather": {"api_key": "api_key_123"},
-            "influxdb": {"host": "http://localhost", "token": "token_123"},
             "modbus": {"host": "192.168.1.100"},  # noqa: S1313
         }
 
@@ -379,8 +489,6 @@ class TestConfigurationMigrator:
         assert secrets_data["mqtt_password"] == "secret123"
         assert "weather_api_key" in secrets_data
         assert secrets_data["weather_api_key"] == "api_key_123"
-        assert "influxdb_token" in secrets_data
-        assert secrets_data["influxdb_token"] == "token_123"
 
         # Check that secrets were replaced with !secret references
         from solaredge2mqtt.core.settings.migrator import SecretReference
@@ -389,13 +497,10 @@ class TestConfigurationMigrator:
         assert config_data["mqtt"]["password"].secret_key == "mqtt_password"
         assert isinstance(config_data["weather"]["api_key"], SecretReference)
         assert config_data["weather"]["api_key"].secret_key == "weather_api_key"
-        assert isinstance(config_data["influxdb"]["token"], SecretReference)
-        assert config_data["influxdb"]["token"].secret_key == "influxdb_token"
 
         # Check that non-sensitive data remains
         assert config_data["mqtt"]["broker"] == "mqtt.example.com"
         assert config_data["mqtt"]["username"] == "user"
-        assert config_data["influxdb"]["host"] == "http://localhost"
         assert config_data["modbus"]["host"] == "192.168.1.100"  # noqa: S1313
 
     def test_extract_secrets_no_sensitive_data(self):

@@ -11,6 +11,7 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+!dist/*.whl
 downloads/
 eggs/
 .eggs/
@@ -70,6 +71,7 @@ instance/
 .scrapy
 
 # Sphinx documentation
+docs/
 docs/_build/
 
 # PyBuilder
@@ -148,7 +150,6 @@ setup.cfg
 setup.py
 doc
 versioneer.py
-freeze_version.py
 Dockerfile
 .dockerignore
 MANIFEST.in
