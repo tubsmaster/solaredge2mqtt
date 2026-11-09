@@ -79,6 +79,18 @@ Step by step, with every option explained:
 | [Architecture Decisions](https://deroetzi.github.io/solaredge2mqtt/decisions/) | Why the project is built the way it is |
 | [Contributing](CONTRIBUTING.md) | Development setup, tests, pull requests |
 
+## Updating from Upstream
+
+If you maintain a fork with the original project configured as the `upstream` remote, fetch and
+review its updates before merging them into your current branch:
+
+```bash
+git fetch upstream
+git log --oneline HEAD..upstream/main
+git diff HEAD..upstream/main
+git merge upstream/main
+```
+
 ## 💬 Contact and Feedback
 
 For questions and discussion, join us on Discord.
