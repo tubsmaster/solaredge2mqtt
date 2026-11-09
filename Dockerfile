@@ -15,7 +15,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.12.3 /uv /usr/local/bin/uv
 COPY pyproject.toml uv.lock ./
 
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
-    uv sync --frozen --no-install-project --extra forecast
+    uv sync --frozen --no-install-project
 
 # The wheel carries the actual package -- including the version setuptools-scm
 # resolved from git at build time in build-check -- and installs on top of the
